@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      # One interpreter failing should not hide the result on the others.
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Smoke-test the CLI
+        # The suite covers the modules; this covers the packaged entry point on
+        # each interpreter, and checks the guarantee the pipeline is built
+        # around: the replayed keystrokes reproduce the input.
+        run: |
+          python main.py \
+            --text "The quick brown fox jumps over the lazy dog." \
+            --seed 42 \
+            --output record.json
+          python - <<'PY'
+          import json
+
+          record = json.load(open("record.json", encoding="utf-8"))
+          assert record["synthetic_research_data"] is True, "watermark missing"
+          assert record["target_text"] == "The quick brown fox jumps over the lazy dog."
+          assert record["statistics"]["keystrokes"] > 0, "no keystrokes generated"
+          print(record["statistics"]["keystrokes"], "keystrokes generated")
+          PY
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install "ruff>=0.6"
+
+      # Rule selection and target version come from [tool.ruff] in pyproject.toml.
+      - name: Lint
+        run: ruff check --output-format=github .

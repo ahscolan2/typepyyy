@@ -1,246 +1,431 @@
 """
 Project Aletheia - Macro Scripter
-Generates high-level writing process events (bursts, pauses, revisions).
-Ensures the final text state exactly matches the input.
-Based on Chenoweth & Hayes / Leijten & Van Waes literature.
+
+Generates the high-level writing process: bursts of fluent typing separated by
+pauses, typos that get corrected, revisions that delete and retype, and gaps
+between writing sessions.
+
+The output is a flat list of ScriptEvent operations that, replayed in order,
+reproduce the target text exactly. That invariant is the point of this module:
+everything downstream assumes `replay(generate_script(text)) == text`.
+
+Based on Chenoweth & Hayes (P-bursts and R-bursts) and Leijten & Van Waes
+(revision behaviour).
 """
 
 import random
-import math
-from typing import List, Tuple, Dict, Any, Optional
+import unicodedata
 from dataclasses import dataclass
+from typing import Dict, List, Optional
+
+# Operation names.
+OP_TYPE = "TYPE"
+OP_DELETE = "DELETE"
+OP_PAUSE = "PAUSE"
+OP_SESSION_GAP = "SESSION_GAP"
+
+# Roles, recorded on each event so a downstream consumer can label keystrokes
+# without having to re-derive intent from the operation sequence.
+ROLE_TEXT = "text"
+ROLE_TYPO = "typo"
+ROLE_CORRECTION = "correction"
+ROLE_REVISION_DELETE = "revision_delete"
+ROLE_REVISION_RETYPE = "revision_retype"
+
+# Chenoweth & Hayes burst lengths, in words.
+P_BURST_RANGE = (8, 13)
+R_BURST_RANGE = (3, 7)
+R_BURST_PROBABILITY = 0.20
+
+# Lognormal pause parameters (mu, sigma) on log-milliseconds. Medians are
+# exp(mu): 90ms, 181ms, 493ms, 1097ms respectively. Verified in
+# tests/test_macro_scripter.py::test_pause_medians.
+PAUSE_WORD = (4.5, 0.4)
+PAUSE_CLAUSE = (5.2, 0.5)
+PAUSE_SENTENCE = (6.2, 0.6)
+PAUSE_PARAGRAPH = (7.0, 0.7)
+
+# Reaction time before noticing and fixing a typo, ms.
+TYPO_REACTION_RANGE = (300.0, 800.0)
+
+# Pause before beginning a revision, and before retyping after one.
+REVISION_PAUSE_RANGE = (400.0, 1500.0)
+
+TYPO_RATE = 0.03
+
+# Fraction of a completed R-burst that gets deleted and retyped.
+#
+# With R_BURST_PROBABILITY at the cited 0.20 this yields an overall deletion
+# ratio of roughly 0.09 - just below the 0.10-0.30 range reported for real
+# composition. The shortfall is a known limitation of the model, not a
+# mis-tuning: revision here is local to the burst just written, and does not
+# include the structural rewriting (deleting and reworking whole sentences or
+# paragraphs) that makes up much of the deletion in real writing. Raising
+# r_burst_probability to ~0.25 brings the ratio into the reported range if a
+# consumer would rather match the aggregate than the cited burst rate.
+REVISION_FRACTION_RANGE = (0.4, 1.0)
+
+# A writing session runs 20-90 minutes. Converted to characters using a nominal
+# composition rate, since this module works in characters rather than time.
+SESSION_MINUTES_RANGE = (20.0, 90.0)
+NOMINAL_COMPOSITION_CPM = 160.0
+
+# Gaps between sessions, in hours, with the weights of a student working over
+# several days: mostly overnight or next-evening, occasionally a short break.
+SESSION_GAP_HOURS = (0.5, 1.0, 2.0, 4.0, 16.0, 24.0, 48.0)
+SESSION_GAP_WEIGHTS = (0.10, 0.12, 0.15, 0.15, 0.18, 0.20, 0.10)
+
+SENTENCE_ENDERS = frozenset(".!?")
+CLAUSE_ENDERS = frozenset(",;:")
+
+# Physically adjacent keys on a QWERTY board, used for substitution typos.
+NEIGHBOR_KEYS: Dict[str, List[str]] = {
+    'q': ['w', 'a', 's'],
+    'w': ['q', 'e', 'a', 's', 'd'],
+    'e': ['w', 'r', 's', 'd', 'f'],
+    'r': ['e', 't', 'd', 'f', 'g'],
+    't': ['r', 'y', 'f', 'g', 'h'],
+    'y': ['t', 'u', 'g', 'h', 'j'],
+    'u': ['y', 'i', 'h', 'j', 'k'],
+    'i': ['u', 'o', 'j', 'k', 'l'],
+    'o': ['i', 'p', 'k', 'l'],
+    'p': ['o', 'l', ';'],
+    'a': ['q', 'w', 's', 'z'],
+    's': ['a', 'w', 'e', 'd', 'z', 'x'],
+    'd': ['s', 'e', 'r', 'f', 'x', 'c'],
+    'f': ['d', 'r', 't', 'g', 'c', 'v'],
+    'g': ['f', 't', 'y', 'h', 'v', 'b'],
+    'h': ['g', 'y', 'u', 'j', 'b', 'n'],
+    'j': ['h', 'u', 'i', 'k', 'n', 'm'],
+    'k': ['j', 'i', 'o', 'l', 'm'],
+    'l': ['k', 'o', 'p', ';'],
+    'z': ['a', 's', 'x'],
+    'x': ['z', 's', 'd', 'c'],
+    'c': ['x', 'd', 'f', 'v'],
+    'v': ['c', 'f', 'g', 'b'],
+    'b': ['v', 'g', 'h', 'n'],
+    'n': ['b', 'h', 'j', 'm'],
+    'm': ['n', 'j', 'k'],
+}
+
 
 @dataclass
 class ScriptEvent:
-    op: str  # TYPE, PAUSE, DELETE, JUMP, SELECT, REPLACE, SESSION_GAP
-    data: Any = None
-    timestamp_ms: float = 0.0
+    """One operation in the writing process.
+
+    Exactly one payload field is meaningful per op:
+      TYPE         -> char
+      DELETE       -> count
+      PAUSE        -> duration_ms
+      SESSION_GAP  -> duration_ms
+    """
+
+    op: str
+    char: Optional[str] = None
+    count: int = 0
+    duration_ms: float = 0.0
+    role: str = ROLE_TEXT
+
+    def to_dict(self) -> dict:
+        d = {"op": self.op, "role": self.role}
+        if self.op == OP_TYPE:
+            d["char"] = self.char
+        elif self.op == OP_DELETE:
+            d["count"] = self.count
+        else:
+            d["duration_ms"] = round(self.duration_ms, 3)
+        return d
+
+
+def replay(events: List[ScriptEvent]) -> str:
+    """Apply the script to an empty buffer and return the resulting text.
+
+    This is the ground truth for what a script produces. DELETE is a backspace
+    at the end of the buffer, matching how the events are emitted.
+    """
+    buffer: List[str] = []
+    for event in events:
+        if event.op == OP_TYPE:
+            if event.char is None:
+                raise ValueError("TYPE event has no char")
+            buffer.append(event.char)
+        elif event.op == OP_DELETE:
+            if event.count < 0:
+                raise ValueError(f"DELETE count must be >= 0, got {event.count}")
+            if event.count > len(buffer):
+                raise ValueError(
+                    f"DELETE of {event.count} exceeds buffer length {len(buffer)}"
+                )
+            if event.count:
+                del buffer[-event.count:]
+    return "".join(buffer)
+
+
+def _is_newline(ch: str) -> bool:
+    return ch in ("\n", "\r", " ", " ")
+
+
+def tokenize(text: str) -> List[str]:
+    """Split into word tokens and individual whitespace characters.
+
+    Whitespace is emitted one character at a time so each space, tab and
+    newline becomes its own keystroke. Every other run of non-space characters
+    is one word token. Concatenating the result reproduces the input exactly.
+    """
+    tokens: List[str] = []
+    current: List[str] = []
+    for ch in text:
+        # str.isspace() is true for unicode separators too, which is what we
+        # want - they are all single keystrokes or pasted whitespace.
+        if ch.isspace():
+            if current:
+                tokens.append("".join(current))
+                current = []
+            tokens.append(ch)
+        else:
+            current.append(ch)
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
 
 class MacroScripter:
-    def __init__(self, seed: Optional[int] = None):
-        if seed is not None:
-            random.seed(seed)
-        
-        # Parameters from Chenoweth & Hayes / Leijten & Van Waes
-        self.p_burst_min, self.p_burst_max = 8, 13  # P-burst: 8-13 words
-        self.r_burst_min, self.r_burst_max = 3, 7   # R-burst: 3-7 words
-        self.r_burst_prob = 0.20                    # 20% of bursts are revision bursts
-        
-        # Pause distributions (lognormal mu, sigma) - ms
-        self.pause_word = (4.5, 0.4)      # ~90ms median
-        self.pause_clause = (5.2, 0.5)    # ~180ms median
-        self.pause_sentence = (6.2, 0.6)  # ~500ms median
-        self.pause_paragraph = (7.0, 0.7) # ~1100ms median
-        
-        # Revision parameters
-        self.deletion_rate = 0.15  # 15% of chars typed get deleted eventually
-        self.typo_rate = 0.03      # 3% typo injection
-        
-        # Neighbor keys for typo injection
-        self.neighbor_keys = {
-            'e': ['w', 'r', 'd', 's', 'f'], 't': ['r', 'y', 'f', 'g'], 
-            'y': ['t', 'u', 'g', 'h'], 'u': ['y', 'i', 'h', 'j'],
-            'i': ['u', 'o', 'j', 'k'], 'o': ['i', 'p', 'k', 'l'],
-            'p': ['o', 'l', ';'], 'a': ['q', 'w', 's', 'z', 'x'],
-            's': ['a', 'w', 'd', 'z', 'x', 'c'], 'd': ['s', 'e', 'f', 'x', 'c', 'v'],
-            'f': ['d', 'r', 'g', 'c', 'v', 'b'], 'g': ['f', 't', 'h', 'v', 'b', 'n'],
-            'h': ['g', 'y', 'j', 'b', 'n', 'm'], 'j': ['h', 'u', 'k', 'n', 'm'],
-            'k': ['j', 'i', 'l', 'm'], 'l': ['k', 'o', ';', ','],
-            'z': ['a', 's', 'x'], 'x': ['z', 's', 'd', 'c'],
-            'c': ['x', 'd', 'f', 'v'], 'v': ['c', 'f', 'g', 'b'],
-            'b': ['v', 'g', 'h', 'n'], 'n': ['b', 'h', 'j', 'm'],
-            'm': ['n', 'j', 'k', ',']
-        }
+    """Generates a writing-process script for a target text.
 
-    def _lognormal_sample(self, mu: float, sigma: float) -> float:
-        """Generate lognormal sample for pause duration."""
-        u1 = max(random.random(), 1e-10)
-        u2 = random.random()
-        z0 = math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
-        normal_val = mu + sigma * z0
-        return math.exp(normal_val)
+    Owns its own Random instance, so two scripters with the same seed produce
+    identical scripts regardless of any other use of randomness in the process.
+    """
 
-    def _get_pause(self, context: str) -> float:
-        """Determine pause based on punctuation context."""
-        if context in ['\n', '\n\n']:
-            return self._lognormal_sample(*self.pause_paragraph)
-        elif context in ['.', '!', '?']:
-            return self._lognormal_sample(*self.pause_sentence)
-        elif context in [',', ';', ':']:
-            return self._lognormal_sample(*self.pause_clause)
+    def __init__(
+        self,
+        seed: Optional[int] = None,
+        typo_rate: float = TYPO_RATE,
+        r_burst_probability: float = R_BURST_PROBABILITY,
+        session_chars: Optional[int] = None,
+    ):
+        if not 0.0 <= typo_rate <= 1.0:
+            raise ValueError(f"typo_rate must be in [0, 1], got {typo_rate}")
+        if not 0.0 <= r_burst_probability <= 1.0:
+            raise ValueError(
+                f"r_burst_probability must be in [0, 1], got {r_burst_probability}"
+            )
+        if session_chars is not None and session_chars <= 0:
+            raise ValueError(f"session_chars must be positive, got {session_chars}")
+
+        self._rng = random.Random(seed)
+        self.typo_rate = typo_rate
+        self.r_burst_probability = r_burst_probability
+        self.session_chars = session_chars
+
+    # -- sampling ------------------------------------------------------------
+
+    def _pause_ms(self, context: str) -> float:
+        """Sample a pause appropriate to what was just typed."""
+        if context == "paragraph":
+            mu, sigma = PAUSE_PARAGRAPH
+        elif context == "sentence":
+            mu, sigma = PAUSE_SENTENCE
+        elif context == "clause":
+            mu, sigma = PAUSE_CLAUSE
         else:
-            return self._lognormal_sample(*self.pause_word)
+            mu, sigma = PAUSE_WORD
+        return self._rng.lognormvariate(mu, sigma)
 
-    def _inject_typo(self, char: str) -> Tuple[str, bool]:
-        """Inject a neighbor-key typo."""
-        if random.random() > self.typo_rate or char.lower() not in self.neighbor_keys:
-            return char, False
-        
-        typo_char = random.choice(self.neighbor_keys[char.lower()])
+    def _next_session_length(self) -> int:
+        minutes = self._rng.uniform(*SESSION_MINUTES_RANGE)
+        return int(minutes * NOMINAL_COMPOSITION_CPM)
+
+    def _maybe_typo(self, char: str) -> Optional[str]:
+        """Return a neighbour-key substitution for `char`, or None."""
+        if self._rng.random() >= self.typo_rate:
+            return None
+        neighbors = NEIGHBOR_KEYS.get(char.lower())
+        if not neighbors:
+            return None
+        typo = self._rng.choice(neighbors)
         if char.isupper():
-            typo_char = typo_char.upper()
-        return typo_char, True
+            typo = typo.upper()
+        # A "typo" identical to the intended character is not a typo. It cannot
+        # happen with the current table, but the guard keeps the invariant
+        # explicit if the table is ever edited.
+        if typo == char:
+            return None
+        return typo
 
-    def generate_script(self, text: str) -> Tuple[List[ScriptEvent], List[Tuple[int, str]]]:
-        """
-        Generate a sequence of operations that results in `text`.
-        Returns: (script, typo_corrections) where typo_corrections is list of (index, original_char)
-        """
-        script = []
-        typo_corrections = []
-        
-        # Pre-process text into tokens (words + punctuation)
-        # Simple tokenization: split by spaces but keep punctuation attached
-        tokens = []
-        current_token = ""
-        for char in text:
-            if char == ' ':
-                if current_token:
-                    tokens.append(current_token)
-                    current_token = ""
-                tokens.append(' ')
-            elif char == '\n':
-                if current_token:
-                    tokens.append(current_token)
-                    current_token = ""
-                tokens.append('\n')
-            else:
-                current_token += char
-        if current_token:
-            tokens.append(current_token)
-        
-        # Session gap logic
-        session_gap_interval = max(150, len(text) // 4)
-        chars_processed = 0
-        next_gap_at = session_gap_interval
-        
-        # Burst logic
-        word_count_in_burst = 0
-        burst_limit = random.randint(self.p_burst_min, self.p_burst_max)
-        is_r_burst = random.random() < self.r_burst_prob
-        if is_r_burst:
-            burst_limit = random.randint(self.r_burst_min, self.r_burst_max)
-        
-        global_char_index = 0
-        
-        for token in tokens:
-            # Check session gap
-            if chars_processed >= next_gap_at and len(script) > 0:
-                gap_hours = random.choice([0.5, 1, 2, 4, 24, 48])
-                script.append(ScriptEvent("SESSION_GAP", data={"hours": gap_hours}))
-                next_gap_at += session_gap_interval
-            
-            # Handle space - just add pause and type space
-            if token == ' ':
-                pause_dur = self._get_pause(' ')
-                script.append(ScriptEvent("PAUSE", data={"ms": pause_dur}))
-                script.append(ScriptEvent("TYPE", data=' '))
-                chars_processed += 1
-                global_char_index += 1
+    def _burst_limit(self) -> tuple:
+        """Return (word_limit, is_revision_burst) for the next burst."""
+        if self._rng.random() < self.r_burst_probability:
+            return self._rng.randint(*R_BURST_RANGE), True
+        return self._rng.randint(*P_BURST_RANGE), False
+
+    @staticmethod
+    def _context_after(token: str) -> str:
+        """Classify the pause that should follow a word token."""
+        if not token:
+            return "word"
+        # Trailing punctuation may be followed by a quote or bracket.
+        for ch in reversed(token):
+            if ch in SENTENCE_ENDERS:
+                return "sentence"
+            if ch in CLAUSE_ENDERS:
+                return "clause"
+            category = unicodedata.category(ch)
+            # Skip closing punctuation and quotes to find the real terminator.
+            if category in ("Pe", "Pf", "Po") and ch in "\"')]}’”":
                 continue
-            
-            # Handle newline
-            if token == '\n':
-                pause_dur = self._get_pause('\n')
-                script.append(ScriptEvent("PAUSE", data={"ms": pause_dur}))
-                script.append(ScriptEvent("TYPE", data='\n'))
-                chars_processed += 1
-                global_char_index += 1
-                continue
-            
-            # Process word token
-            word_chars = list(token)
-            for i, char in enumerate(word_chars):
-                # Check burst limit (only at word boundaries)
-                if i == 0 and word_count_in_burst >= burst_limit:
-                    # End burst with pause
-                    context = token[-1] if token else ' '
-                    if context in '.!?': context = '.'
-                    elif context in ',;:': context = ','
-                    pause_dur = self._get_pause(context)
-                    script.append(ScriptEvent("PAUSE", data={"ms": pause_dur}))
-                    
-                    # Start new burst
-                    is_r_burst = random.random() < self.r_burst_prob
-                    burst_limit = random.randint(
-                        self.r_burst_min if is_r_burst else self.p_burst_min,
-                        self.r_burst_max if is_r_burst else self.p_burst_max
+            break
+        return "word"
+
+    # -- script construction -------------------------------------------------
+
+    def generate_script(self, text: str) -> List[ScriptEvent]:
+        """Build the full writing-process script for `text`.
+
+        Guarantees `replay(result) == text`.
+        """
+        events: List[ScriptEvent] = []
+        if not text:
+            return events
+
+        tokens = tokenize(text)
+
+        burst_limit, is_r_burst = self._burst_limit()
+        words_in_burst = 0
+
+        session_limit = self.session_chars or self._next_session_length()
+        chars_this_session = 0
+
+        # Characters of the target text committed so far, used to bound how far
+        # a revision may delete back.
+        committed = 0
+        # Where the current burst started, in committed characters.
+        burst_start = 0
+
+        pending_context: Optional[str] = None
+
+        for index, token in enumerate(tokens):
+            is_whitespace = token.isspace()
+
+            # A session gap goes at a token boundary, never mid-word, and never
+            # after the final token (nobody stops writing then comes back to
+            # type nothing).
+            if chars_this_session >= session_limit and index < len(tokens) - 1:
+                events.append(
+                    ScriptEvent(
+                        OP_SESSION_GAP,
+                        duration_ms=self._sample_session_gap_ms(),
                     )
-                    word_count_in_burst = 0
-                
-                # Typo injection
-                typo_char, is_typo = self._inject_typo(char)
-                
-                if is_typo:
-                    script.append(ScriptEvent("TYPE", data=typo_char))
-                    reaction_pause = random.uniform(300, 800)
-                    script.append(ScriptEvent("PAUSE", data={"ms": reaction_pause}))
-                    script.append(ScriptEvent("DELETE", data=1))
-                    script.append(ScriptEvent("TYPE", data=char))
-                    typo_corrections.append((global_char_index, char))
+                )
+                chars_this_session = 0
+                session_limit = self.session_chars or self._next_session_length()
+                pending_context = None
+                # Returning to the document restarts the burst.
+                burst_limit, is_r_burst = self._burst_limit()
+                words_in_burst = 0
+                burst_start = committed
+
+            if is_whitespace:
+                context = pending_context or (
+                    "paragraph" if _is_newline(token) else "word"
+                )
+                events.append(
+                    ScriptEvent(OP_PAUSE, duration_ms=self._pause_ms(context))
+                )
+                events.append(ScriptEvent(OP_TYPE, char=token))
+                committed += 1
+                chars_this_session += 1
+                pending_context = None
+                continue
+
+            # Word token. If the burst is finished, pause and start a new one -
+            # possibly revising what was just written first.
+            if words_in_burst >= burst_limit:
+                if is_r_burst and committed > burst_start:
+                    events.extend(self._revise(text, burst_start, committed))
+                events.append(
+                    ScriptEvent(OP_PAUSE, duration_ms=self._pause_ms("sentence"))
+                )
+                burst_limit, is_r_burst = self._burst_limit()
+                words_in_burst = 0
+                burst_start = committed
+
+            for char in token:
+                typo = self._maybe_typo(char)
+                if typo is not None:
+                    events.append(
+                        ScriptEvent(OP_TYPE, char=typo, role=ROLE_TYPO)
+                    )
+                    events.append(
+                        ScriptEvent(
+                            OP_PAUSE,
+                            duration_ms=self._rng.uniform(*TYPO_REACTION_RANGE),
+                            role=ROLE_TYPO,
+                        )
+                    )
+                    events.append(
+                        ScriptEvent(OP_DELETE, count=1, role=ROLE_CORRECTION)
+                    )
+                    events.append(
+                        ScriptEvent(OP_TYPE, char=char, role=ROLE_CORRECTION)
+                    )
                 else:
-                    script.append(ScriptEvent("TYPE", data=char))
-                
-                chars_processed += 1
-                global_char_index += 1
-            
-            word_count_in_burst += 1
-        
-        return script, typo_corrections
+                    events.append(ScriptEvent(OP_TYPE, char=char))
+                committed += 1
+                chars_this_session += 1
 
-    def verify_script(self, text: str, script: List[ScriptEvent]) -> bool:
-        """Replay script virtually to ensure it produces exact text."""
-        buffer = []
-        for event in script:
-            if event.op == "TYPE":
-                buffer.append(event.data)
-            elif event.op == "DELETE":
-                if buffer:
-                    buffer.pop()
-            elif event.op == "REPLACE":
-                if isinstance(event.data, dict) and 'text' in event.data:
-                    buffer.append(event.data['text'])
-        
-        result = "".join(buffer)
-        return result == text
+            words_in_burst += 1
+            pending_context = self._context_after(token)
 
-def run_test():
-    print("--- Macro Scripter Test ---")
-    test_text = "First sentence. Second sentence."
-    scripter = MacroScripter(seed=42)
-    script, typos = scripter.generate_script(test_text)
-    
-    is_valid = scripter.verify_script(test_text, script)
-    print(f"Input: '{test_text}'")
-    print(f"Script Length: {len(script)} events")
-    print(f"Typos Injected: {len(typos)}")
-    print(f"Verification: {'PASS' if is_valid else 'FAIL'}")
-    
-    if not is_valid:
-        buffer = []
-        for e in script:
-            if e.op == "TYPE": buffer.append(e.data)
-            elif e.op == "DELETE" and buffer: buffer.pop()
-        generated = ''.join(buffer)
-        print(f"Generated: '{generated}'")
-        print(f"Mismatch at index: ", end="")
-        for i, (a, b) in enumerate(zip(test_text, generated)):
-            if a != b:
-                print(i)
-                break
-        else:
-            print("Length mismatch")
-    
-    # Test longer text
-    print("\n--- Longer Text Test ---")
-    long_text = "This is a longer paragraph. It has multiple sentences. We need to verify it works."
-    script2, typos2 = scripter.generate_script(long_text)
-    valid2 = scripter.verify_script(long_text, script2)
-    print(f"Input: '{long_text}'")
-    print(f"Verification: {'PASS' if valid2 else 'FAIL'}")
-    
-    return is_valid and valid2
+        return events
 
-if __name__ == "__main__":
-    success = run_test()
-    exit(0 if success else 1)
+    def _sample_session_gap_ms(self) -> float:
+        hours = self._rng.choices(SESSION_GAP_HOURS, weights=SESSION_GAP_WEIGHTS)[0]
+        # Jitter so gaps are not all exactly round numbers of hours.
+        hours *= self._rng.uniform(0.85, 1.15)
+        return hours * 3_600_000.0
+
+    def _revise(self, text: str, burst_start: int, committed: int) -> List[ScriptEvent]:
+        """Delete back into the just-written burst and retype it.
+
+        This is what makes an R-burst a revision burst rather than just a short
+        one. The deleted span is retyped verbatim from the target text, so the
+        buffer ends where it started and the replay invariant holds.
+        """
+        span = committed - burst_start
+        if span <= 0:
+            return []
+
+        fraction = self._rng.uniform(*REVISION_FRACTION_RANGE)
+        delete_count = max(1, min(span, int(round(span * fraction))))
+
+        retyped = text[committed - delete_count:committed]
+        if not retyped:
+            return []
+
+        events: List[ScriptEvent] = [
+            ScriptEvent(
+                OP_PAUSE,
+                duration_ms=self._rng.uniform(*REVISION_PAUSE_RANGE),
+                role=ROLE_REVISION_DELETE,
+            ),
+            ScriptEvent(
+                OP_DELETE, count=delete_count, role=ROLE_REVISION_DELETE
+            ),
+            ScriptEvent(
+                OP_PAUSE,
+                duration_ms=self._rng.uniform(*REVISION_PAUSE_RANGE),
+                role=ROLE_REVISION_RETYPE,
+            ),
+        ]
+        events.extend(
+            ScriptEvent(OP_TYPE, char=ch, role=ROLE_REVISION_RETYPE)
+            for ch in retyped
+        )
+        return events
+
+    def verify_script(self, text: str, events: List[ScriptEvent]) -> bool:
+        """True if replaying `events` reproduces `text` exactly."""
+        try:
+            return replay(events) == text
+        except ValueError:
+            return False

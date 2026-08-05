@@ -1,0 +1,103 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aletheia"
+# Tracks the record "schema_version" emitted in main.WATERMARK, so a dataset can
+# be traced back to the generator release that produced it.
+version = "2.0.0"
+description = "Offline generator of synthetic writing-process datasets for detector training"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Project Aletheia" }]
+keywords = [
+    "keystroke-dynamics",
+    "synthetic-data",
+    "writing-process",
+    "academic-integrity",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# numpy is the only third-party import in the package: timing_engine draws from a
+# per-instance np.random.Generator.
+dependencies = [
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.6",
+]
+
+[project.urls]
+Homepage = "https://github.com/ahscolan2/aletheia"
+
+[project.scripts]
+# main.main returns an exit code, which is exactly what console_scripts expects.
+aletheia = "main:main"
+
+[tool.setuptools]
+# The package is a set of flat modules at the repository root rather than a
+# package directory, so that "python main.py" from a checkout keeps working
+# unchanged. py-modules preserves that layout when installed.
+py-modules = [
+    "error_models",
+    "gui",
+    "macro_scripter",
+    "main",
+    "pipeline",
+    "replay",
+    "timing_engine",
+]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra --strict-markers --strict-config"
+python_files = ["test_*.py"]
+markers = [
+    # Statistical tests that need enough samples (or enough seeds) to be
+    # stable. They are part of the default run; the marker exists so a quick
+    # iteration loop can skip them with -m "not slow".
+    "slow: statistical test over many samples or seeds",
+]
+# The flat-module layout means tests import macro_scripter, pipeline and friends
+# directly. Stating the root explicitly keeps that working from a tests/
+# subdirectory as well as from the root.
+pythonpath = ["."]
+norecursedirs = [
+    ".git",
+    ".venv",
+    "venv",
+    "build",
+    "dist",
+    "datasets",
+    "__pycache__",
+    # Archived, not part of the package. See its README.
+    "legacy_browser_path",
+]
+
+[tool.ruff]
+target-version = "py310"
+# Archived code that is not part of the package and is not maintained here. It
+# is excluded so that editing it can never turn the lint gate red for changes
+# that have nothing to do with it. See legacy_browser_path/README.md.
+exclude = ["legacy_browser_path"]
+
+[tool.ruff.lint]
+# Restricted to the rules that flag genuine defects - syntax errors, undefined
+# names, broken comparisons - rather than style. The wider default set currently
+# reports stylistic findings across the existing modules, and a lint gate that is
+# red on a clean checkout teaches everyone to ignore it.
+select = ["E9", "F63", "F7", "F82"]
