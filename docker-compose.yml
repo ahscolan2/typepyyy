@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  aletheia:
+    build: .
+    volumes:
+      # Mount local datasets folder to persist output
+      - ./datasets:/app/datasets
+      # Mount local corpus if needed
+      - ./corpus:/app/corpus
+    environment:
+      - PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+      - PYTHONUNBUFFERED=1
+    # Run as non-root for security (optional, requires user setup)
+    # user: "1000:1000"
+    command: ["--mode", "dry-run", "--text", "Sample text for testing."]
