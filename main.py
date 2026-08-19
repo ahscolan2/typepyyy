@@ -277,6 +277,19 @@ def emit_record(record: dict, args: argparse.Namespace) -> dict:
 
 
 def main(argv: Optional[list] = None) -> int:
+    # Every byte of the record can reach stdout (the JSON is dumped with
+    # ensure_ascii=False and replay text passes through), so pin stdout to
+    # UTF-8 before anything is written. A cp1252 console would otherwise die
+    # mid-write with a charmap error and lose the whole record. Only the
+    # encoding changes: newline translation stays as-is, and errors stay
+    # strict because UTF-8 encodes everything. stderr keeps reporting to the
+    # console as before and the -o path is already explicit UTF-8.
+    reconfigure_stdout = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure_stdout is not None:
+        try:
+            reconfigure_stdout(encoding="utf-8")
+        except (ValueError, OSError):
+            pass  # an exotic stream (closed, wrapped): nothing we can pin
     args = build_parser().parse_args(argv)
 
     try:
