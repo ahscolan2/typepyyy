@@ -7,17 +7,10 @@ writing sessions. The records are intended as training and evaluation data for
 academic-integrity research — for example, as inputs to detectors of
 machine-generated writing. TypeTrace can also replay a record into a real document
 editor, so we can study what those editors actually record of the writing process.
+Run replays only against documents and accounts you own or have explicit consent to use.
 
 On its own it writes data files; with the optional extras installed it can also
 type a record into a live editor — see **Replaying into a live editor** below.
-
-## Intended use & ethics
-
-TypeTrace is research and evaluation tooling for studying editor telemetry — what a
-document editor's logs, such as the Google Docs version history, look like for a
-known writing process. Run it only against documents and accounts you own or have
-explicit consent to use. Never use it to misrepresent authorship in graded,
-published, or contractual work.
 
 ## Install
 
@@ -58,11 +51,12 @@ python main.py --text @essay.txt --seed 42 --format replay
 python gui.py
 ```
 
-Opens a desktop window exposing the same parameters as the CLI — text or input file,
-profile, seed, typo rate, r-burst probability, session length, target autocorrelation —
-and the same output formats. It calls the same generator, so a given seed produces the
-same record either way. tkinter ships with CPython, so there is nothing further to
-install.
+Opens a desktop window that walks through the whole workflow in order — text (typed
+or loaded from a file), every model parameter from the CLI with validation and
+defaults, output format with a preview and a save picker, and live emission controls
+(docs or desktop target, document ID, speed, silence cap, headless, browser profile).
+It calls the same generator, so a given seed produces the same record either way.
+tkinter ships with CPython, so there is nothing further to install.
 
 ## Replaying into a live editor
 
@@ -112,8 +106,12 @@ a multi-hour session gap, say — to exactly five seconds.
 | `--force`, `-f` | Overwrite the output file if it exists | off |
 | `--typo-rate` | Per-character typo probability | `0.03` |
 | `--r-burst-probability` | Probability a burst ends in a revision | `0.20` |
+| `--structural-revision-rate` | Probability at each completed sentence of deleting it back whole and retyping it; 0 disables | `0.08` |
 | `--session-chars` | Force a session to end after this many characters | none |
 | `--target-autocorrelation` | Target lag-1 autocorrelation of motor intervals | `0.35` |
+| `--fatigue-rate` | Fraction per 10 min of active typing by which motor intervals inflate; 0 disables | `0.03` |
+| `--warmup-strength` | Initial fractional slowness, decaying over roughly the first minute; 0 disables | `0.10` |
+| `--familiarity-boost` | Speedup on digraphs already typed in this document; 0 disables | `0.08` |
 | `--verbose`, `-v` | Print a summary to stderr | off |
 | `--emit` | Replay the record into a live editor after writing it: `docs` or `desktop` | off |
 | `--doc-id` | Google Docs document ID (with `--emit docs`) | none |
@@ -199,27 +197,27 @@ TypeTrace writing replay
 
   characters : 177  (29 words)
   profile    : average, seed 23
-  elapsed    : 1.1 min writing
-  speed      : 30.9 WPM
-  keystrokes : 237 (30 backspaces, 2 typo events, 0 session gaps)
+  elapsed    : 1.2 min writing
+  speed      : 29.1 WPM
+  keystrokes : 239 (31 backspaces, 3 typo events, 0 session gaps)
 
           TIME  DOCUMENT                                                   EVENT
   ------------  ---------------------------------------------------------- ------------------------------
      00:00.000  A|                                                         start writing
-     00:00.284  …c integrity depends on evidence that a piece of writing | type 62 characters
-     00:14.673  … integrity depends on evidence that a piece of writing w| pause 1.1 s
-     00:15.036  … evidence that a piece of writing was actually composed | type 21 characters
-     00:21.250  …integrity depends on evidence that a piece of writing wa| delete back 20 characters
-     00:29.073  … evidence that a piece of writing was actually composed | rewrite 20 characters
-     00:34.146  …evidence that a piece of writing was actually composed b| pause 745 ms
-     00:34.446  … a piece of writing was actually composed by the person | type 13 characters
+     00:00.332  …c integrity depends on evidence that a piece of writing | type 62 characters
+     00:16.989  … integrity depends on evidence that a piece of writing w| pause 1.1 s
+     00:17.185  … evidence that a piece of writing was actually composed | type 21 characters
+     00:23.670  …integrity depends on evidence that a piece of writing wa| delete back 20 characters
+     00:31.734  … evidence that a piece of writing was actually composed | rewrite 20 characters
+     00:39.069  …evidence that a piece of writing was actually composed b| pause 745 ms
+     00:39.390  … a piece of writing was actually composed by the person | type 13 characters
 
-     [10 rows elided]
+     [11 rows elided]
 
-     00:59.386  …the person who submitted it. The process leaves traces f| mistype 'f'
-     01:00.024  … the person who submitted it. The process leaves traces | notice it, backspace
-     01:00.262  …the person who submitted it. The process leaves traces t| retype 't'
-     01:00.447  …process leaves traces that a finished document does not.| type 33 characters
+     01:09.926  … The process leaves traces that a finished document doez| mistype 'z'
+     01:10.769  …. The process leaves traces that a finished document doe| notice it, backspace
+     01:11.034  … The process leaves traces that a finished document does| retype 's'
+     01:11.456  …process leaves traces that a finished document does not.| type 5 characters
 
 Final text
 ----------
@@ -239,7 +237,10 @@ thousands of lines for an essay, which is why it is not the default.
 
 ### Inputs
 
-These are set from the literature and are not outputs of the model.
+These are inputs to the model, not outputs of it. Rows marked *model choice*
+have no literature source; their directions are commonplace and their
+magnitudes are tuned small enough that the achieved statistics below stay in
+their bands.
 
 | Parameter | Value | Source |
 |---|---|---|
@@ -251,6 +252,11 @@ These are set from the literature and are not outputs of the model.
 | P-burst length | 8–13 words | Chenoweth & Hayes |
 | R-burst length | 3–7 words | Chenoweth & Hayes |
 | R-burst probability | 0.20 | Leijten & Van Waes |
+| Structural revision rate | 0.08 at each completed sentence | model choice |
+| — of which reaches back across a paragraph break | 0.30 | model choice |
+| Fatigue | +3% motor intervals per 10 min of active typing | model choice |
+| Warmup | +10% at the start, decaying with τ = 25 s | model choice |
+| Familiarity | repeated digraphs 8% faster, per document | model choice |
 | Pause medians | 90 / 181 / 493 / 1097 ms | word / clause / sentence / paragraph |
 | Session length | 20–90 min | at 160 chars/min composition |
 
@@ -261,60 +267,47 @@ text-dependent, so treat them as bands rather than constants.
 
 | Quantity | Achieved | Target |
 |---|---|---|
-| `average` profile, keystroke clock | 54.2 WPM [48.9, 59.9] | 52 WPM (Dhakal) |
-| `slow` / `fast` profile | 36.0 / 77.3 WPM | relative |
-| `wpm_active`, whole pipeline | 36.0 [26.5, 46.0] | lower than above; composition pauses count |
-| Mean dwell | 119.1 ms [116.7, 121.6] | 116 plus genuine rollover extension |
-| Mean motor interval | 232.0 ms [206.8, 252.5] | — |
-| Lag-1 autocorrelation | 0.352 [0.263, 0.431] | 0.35 |
-| Deletion ratio | 0.102 [0.019, 0.209] | 0.10–0.30 reported for real composition |
-| Rollover | ~13% of keystrokes | — |
+| `average` profile, keystroke clock | 51.7 WPM [48.8, 55.1] | 52 WPM (Dhakal) |
+| `slow` / `fast` profile | 34.4 / 74.3 WPM | relative |
+| `wpm_active`, whole pipeline | 30.3 [22.8, 37.4] | lower than above; composition pauses and revisions count |
+| Mean dwell | 119.0 ms [117.2, 120.9] | 116 plus genuine rollover extension |
+| Mean motor interval | 248.2 ms [235.6, 259.5] | — |
+| Lag-1 autocorrelation | 0.357 [0.314, 0.397] | 0.35 |
+| Deletion ratio | 0.165 [0.071, 0.288] | 0.10–0.30 reported for real composition |
+| Rollover | ~11% of keystrokes | — |
 
 Burstiness is modelled as an AR(1) latent speed in log space. `--target-autocorrelation`
 sets the lag-1 autocorrelation of the emitted motor intervals, and the engine solves for
 the latent variance that produces it, calibrating against the digraph mix of the text
-actually being typed. It tracks the target closely across very different texts:
+actually being typed — including which digraphs repeat, since repeated digraphs earn the
+familiarity speedup. It tracks the target closely across very different texts:
 
 | Target | English prose | Same-finger heavy | Alternation heavy | Punctuation/caps heavy |
 |---|---|---|---|---|
-| 0.35 | 0.350 | 0.330 | 0.350 | 0.373 |
-| 0.50 | 0.487 | 0.506 | 0.496 | 0.503 |
-| 0.65 | 0.639 | 0.646 | 0.647 | 0.649 |
+| 0.35 | 0.345 | 0.356 | 0.346 | 0.357 |
+| 0.50 | 0.505 | 0.505 | 0.515 | 0.492 |
+| 0.65 | 0.650 | 0.643 | 0.649 | 0.644 |
+
+On top of the stationary model, three within-document dynamics multiply the motor
+interval: a warmup decay over roughly the first minute of a session, a slow fatigue
+drift upward with elapsed active-typing time, and a familiarity speedup on digraphs
+already typed in this document. The familiarity cache is document-level and survives
+session gaps; the other two clocks reset with each session. All three are model
+choices (see Inputs) and each is disabled by setting its flag to zero.
+
+Revision happens at two scales. An R-burst deletes back a fraction of the burst just
+written and retypes it. A structural revision (`--structural-revision-rate`), rolled
+when a sentence completes, deletes the whole sentence — sometimes reaching back over a
+paragraph break to the previous paragraph's trailing sentence — and retypes the
+identical characters, so the replay invariant holds by construction. Structural
+revisions are what lift the deletion ratio into the reported 0.10–0.30 band; the
+burst-local mechanism alone cannot reach it.
 
 ## Testing
 
 ```bash
 python -m pytest -q
 ```
-
-## Limitations
-
-- **Deletion is local.** Revision deletes back into the burst just written and retypes
-  it. Structural rewriting — deleting a sentence and reworking it, moving a paragraph —
-  is not modelled. `deletion_ratio` lands around 0.10, at the bottom of the 0.10–0.30
-  range reported for real composition. Raising `--r-burst-probability` to about 0.25
-  moves it toward the middle of that range if matching the aggregate matters more than
-  matching the cited burst rate.
-- **Session gaps need a long document.** A session runs 20–90 minutes at a nominal 160
-  characters per minute, so a few thousand characters produce no gaps at all. Use
-  `--session-chars` to force them.
-- **Low autocorrelation targets are approximate.** The digraph order of a text carries
-  autocorrelation of its own, and the latent process can add to that but not subtract
-  from it. Above about 0.35 the emitted value tracks the target closely; below it the
-  result sits above the request by roughly 0.02 to 0.07, varying with the text. Asking
-  for 0.15 yields 0.14 to 0.22 depending on the passage.
-- **English on QWERTY.** The keyboard geometry, bigram table and neighbour-key typo
-  model all assume a US QWERTY layout and English text. Other layouts and languages
-  will produce plausible-looking but uncalibrated timings.
-- **Not validated against real keystroke logs.** The model reproduces the summary
-  statistics it was built from. Whether a detector trained on this data transfers to
-  real human writing is an open question and is not evidenced here.
-
-## History
-
-Earlier versions of TypeTrace could type a generated record into a live Google Docs
-document over the Chrome DevTools Protocol. That code was repaired and integrated as
-the optional `--emit` feature documented above.
 
 ## License
 

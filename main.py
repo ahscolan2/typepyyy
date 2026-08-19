@@ -21,6 +21,7 @@ from typing import Optional
 import macro_scripter as ms
 import replay
 import pipeline
+import timing_engine as te
 
 # Every record carries this so generated data can always be identified as
 # synthetic, wherever it ends up.
@@ -61,6 +62,10 @@ def generate_full_output(
     r_burst_probability: float = ms.R_BURST_PROBABILITY,
     session_chars: Optional[int] = None,
     target_autocorrelation: Optional[float] = None,
+    structural_revision_rate: float = ms.STRUCTURAL_REVISION_RATE,
+    fatigue_rate: float = te.FATIGUE_RATE,
+    warmup_strength: float = te.WARMUP_STRENGTH,
+    familiarity_boost: float = te.FAMILIARITY_BOOST,
 ) -> dict:
     """Generate one watermarked synthetic record for `text`."""
     record = pipeline.generate(
@@ -71,6 +76,10 @@ def generate_full_output(
         r_burst_probability=r_burst_probability,
         session_chars=session_chars,
         target_autocorrelation=target_autocorrelation,
+        structural_revision_rate=structural_revision_rate,
+        fatigue_rate=fatigue_rate,
+        warmup_strength=warmup_strength,
+        familiarity_boost=familiarity_boost,
     )
     return {**WATERMARK, **record}
 
@@ -144,6 +153,15 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--structural-revision-rate", type=float,
+        default=ms.STRUCTURAL_REVISION_RATE,
+        help=(
+            "Probability at each completed sentence of deleting the whole "
+            "sentence - possibly across burst and paragraph boundaries - and "
+            f"retyping it (default: {ms.STRUCTURAL_REVISION_RATE}; 0 disables)"
+        ),
+    )
+    parser.add_argument(
         "--session-chars", type=int, default=None,
         help=(
             "Force a writing session to end after this many characters. "
@@ -156,6 +174,29 @@ Examples:
         help=(
             "Target lag-1 autocorrelation of the motor inter-key intervals "
             "(default: 0.35). Must be below 0.9."
+        ),
+    )
+    parser.add_argument(
+        "--fatigue-rate", type=float, default=te.FATIGUE_RATE,
+        help=(
+            "Fraction per ten minutes of active typing by which motor "
+            "intervals inflate with fatigue "
+            f"(default: {te.FATIGUE_RATE}; 0 disables)"
+        ),
+    )
+    parser.add_argument(
+        "--warmup-strength", type=float, default=te.WARMUP_STRENGTH,
+        help=(
+            "Initial fractional slowness of motor intervals, decaying over "
+            f"roughly the first minute (default: {te.WARMUP_STRENGTH}; "
+            "0 disables)"
+        ),
+    )
+    parser.add_argument(
+        "--familiarity-boost", type=float, default=te.FAMILIARITY_BOOST,
+        help=(
+            "Speedup on digraphs already typed in this document "
+            f"(default: {te.FAMILIARITY_BOOST}; 0 disables)"
         ),
     )
     parser.add_argument(
@@ -255,6 +296,10 @@ def main(argv: Optional[list] = None) -> int:
             r_burst_probability=args.r_burst_probability,
             session_chars=args.session_chars,
             target_autocorrelation=args.target_autocorrelation,
+            structural_revision_rate=args.structural_revision_rate,
+            fatigue_rate=args.fatigue_rate,
+            warmup_strength=args.warmup_strength,
+            familiarity_boost=args.familiarity_boost,
         )
 
         payload = render_record(record, args.format)

@@ -331,12 +331,17 @@ def test_deletion_ratio_at_defaults_is_near_the_measured_value(long_prose):
         generate(long_prose, seed=seed)["statistics"]["deletion_ratio"]
         for seed in range(12)
     ]
-    assert sum(ratios) / len(ratios) == pytest.approx(0.09, abs=0.04)
+    # Structural revision deletes whole sentences on top of the burst-local
+    # R-burst revision, which is what moves the ratio from ~0.09 into the
+    # 0.10-0.30 band reported for real composition. Measured with the defaults
+    # over these seeds: 0.139.
+    assert sum(ratios) / len(ratios) == pytest.approx(0.14, abs=0.04)
 
 
 def test_no_deletions_when_typos_and_revisions_are_off(long_prose):
     stats = generate(
-        long_prose, seed=1, typo_rate=0.0, r_burst_probability=0.0
+        long_prose, seed=1, typo_rate=0.0, r_burst_probability=0.0,
+        structural_revision_rate=0.0,
     )["statistics"]
     assert stats["backspaces"] == 0
     assert stats["deletion_ratio"] == 0.0
@@ -571,3 +576,59 @@ def test_summarize_on_an_empty_timeline():
     assert stats["mean_iki_ms"] == 0.0
     assert stats["mean_dwell_ms"] == 0.0
     assert stats["lag1_autocorrelation"] == 0.0
+
+
+# --- structural revision and within-document dynamics --------------------------
+
+
+def test_reconstruct_holds_with_structural_revisions_forced(sample_corpus):
+    # generate() itself raises if reconstruction fails, so this also pins the
+    # fail-loud contract with sentence-scale deletion enabled.
+    for index, text in enumerate(sample_corpus):
+        record = generate(
+            text, seed=index % 7, structural_revision_rate=1.0
+        )
+        buffer = []
+        for event in record["keystrokes"]:
+            if event["kind"] == KIND_BACKSPACE:
+                if buffer:
+                    buffer.pop()
+            else:
+                buffer.append(event["char"])
+        assert "".join(buffer) == text, f"sample_corpus[{index}]: {text!r}"
+
+
+def test_structural_revisions_are_counted_in_the_statistics(long_prose):
+    record = generate(long_prose, seed=3, structural_revision_rate=1.0)
+    stats = record["statistics"]
+    revision_deletes = sum(
+        1 for e in record["macro_script"]
+        if e["op"] == ms.OP_DELETE and e["role"] == ms.ROLE_REVISION_DELETE
+    )
+    revision_backspaces = sum(
+        1 for e in record["keystrokes"]
+        if e["kind"] == KIND_BACKSPACE and e["role"] == ms.ROLE_REVISION_DELETE
+    )
+    # A rate of 1.0 revises every completed sentence, and long prose has
+    # several; burst-local revisions can only add to the DELETE count.
+    assert revision_deletes >= long_prose.count(".")
+    assert stats["revision_deleted_chars"] == revision_backspaces
+    assert record["target_text"] == long_prose
+
+
+def test_generate_is_deterministic_with_all_dynamics_on(long_prose):
+    kwargs = dict(
+        structural_revision_rate=0.5,
+        fatigue_rate=0.05,
+        warmup_strength=0.2,
+        familiarity_boost=0.1,
+    )
+    first = generate(long_prose, seed=77, **kwargs)
+    second = generate(long_prose, seed=77, **kwargs)
+    assert first == second
+
+
+def test_different_dynamics_give_different_records(long_prose):
+    first = generate(long_prose, seed=77)
+    second = generate(long_prose, seed=77, familiarity_boost=0.0)
+    assert first != second

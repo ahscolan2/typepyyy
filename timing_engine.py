@@ -28,6 +28,16 @@ which is why SIGMA_A is solved for a *target* rho rather than set by hand. The
 previous version applied AR(1) as a divisor on a linear-space Gumbel draw, where
 the noise term dominated so completely that the emitted autocorrelation was
 ~0.02 against a documented target of 0.70.
+
+On top of the stationary model, three within-document dynamics multiply the
+emitted interval: a warmup decay over roughly the first minute, a slow fatigue
+drift upward with elapsed active-typing time, and a familiarity speedup on
+digraphs already typed in this document. Familiarity is applied inside the
+base delay, so calibrate() measures - and the latent-variance solve accounts
+for - the mix of first-time and repeated digraphs actually being typed; the
+other two are slow multiplicative trends that leave the calibration intact.
+Their magnitudes are model choices (see the constants below), and each can be
+set to zero independently.
 """
 
 import math
@@ -102,10 +112,12 @@ PROFILE_MULTIPLIERS = {
 
 # Global scale factor applied to every inter-key interval so that
 # profile="average" lands near TARGET_WPM_AVERAGE on ordinary English prose.
-# Derived empirically: the raw Salthouse digraph baselines produce a faster
-# stream than the Dhakal population mean, because Salthouse measured skilled
-# transcription typists. See tests/test_timing_engine.py::test_average_profile_wpm.
-WPM_CALIBRATION = 1.6236
+# Derived empirically with the default within-document dynamics enabled: the
+# raw Salthouse digraph baselines produce a faster stream than the Dhakal
+# population mean, because Salthouse measured skilled transcription typists,
+# and the familiarity speedup makes the generated stream faster still on
+# repetitive text. See tests/test_timing_engine.py::test_average_profile_wpm.
+WPM_CALIBRATION = 1.7344
 
 # Probability that an *eligible* opposite-hand digraph is rolled over (the next
 # key goes down before the previous comes up).
@@ -122,6 +134,32 @@ ROLLOVER_REACH_MS = 40.0
 
 # How far the previous key stays down past the next keydown, in ms.
 ROLLOVER_OVERLAP_RANGE = (5.0, 30.0)
+
+# --- Within-document dynamics --------------------------------------------------
+#
+# Model choices, not literature values: the sources behind the constants above
+# treat typing speed as stationary within a session, and supply no figures for
+# drift over the course of one document. The direction of each effect is
+# commonplace - hands tire, warm up, and speed through material they have
+# typed before - so the directions are fixed and the magnitudes are tuned
+# small enough that the headline statistics in the README stay within their
+# measured bands.
+
+# Fatigue: motor intervals inflate by this fraction per ten minutes of active
+# typing (typing time, not pauses or session gaps; the pipeline owns those).
+# 0.03 is a 3% slowdown over ten minutes; 0 disables the drift.
+FATIGUE_RATE = 0.03
+
+# Warmup: the first keystrokes of a session run this fraction slow, decaying
+# exponentially with time constant WARMUP_TAU_MS, so the effect is mostly gone
+# within the first minute. 0 disables it.
+WARMUP_STRENGTH = 0.10
+WARMUP_TAU_MS = 25_000.0
+
+# Familiarity: a digraph already typed in this document runs this fraction
+# faster on each repetition. The cache is document-level, so it persists
+# across the session gaps that reset the other two clocks. 0 disables it.
+FAMILIARITY_BOOST = 0.08
 
 # --- Keyboard geometry -------------------------------------------------------
 
@@ -205,6 +243,9 @@ class TimingEngine:
         seed: Optional[int] = None,
         target_autocorrelation: float = DEFAULT_TARGET_AUTOCORRELATION,
         phi: float = AR1_PHI,
+        fatigue_rate: float = FATIGUE_RATE,
+        warmup_strength: float = WARMUP_STRENGTH,
+        familiarity_boost: float = FAMILIARITY_BOOST,
     ):
         if profile not in PROFILE_MULTIPLIERS:
             raise ValueError(
@@ -217,11 +258,24 @@ class TimingEngine:
                 f"{target_autocorrelation} with phi={phi}. The emitted "
                 f"autocorrelation cannot reach the latent persistence."
             )
+        if not fatigue_rate >= 0.0:
+            raise ValueError(f"fatigue_rate must be >= 0, got {fatigue_rate}")
+        if not 0.0 <= warmup_strength < 1.0:
+            raise ValueError(
+                f"warmup_strength must be in [0, 1), got {warmup_strength}"
+            )
+        if not 0.0 <= familiarity_boost < 1.0:
+            raise ValueError(
+                f"familiarity_boost must be in [0, 1), got {familiarity_boost}"
+            )
 
         self.profile = profile
         self.multiplier = PROFILE_MULTIPLIERS[profile]
         self.phi = phi
         self.target_autocorrelation = target_autocorrelation
+        self.fatigue_rate = fatigue_rate
+        self.warmup_strength = warmup_strength
+        self.familiarity_boost = familiarity_boost
 
         # Per-instance RNGs. Nothing here touches the global random state.
         self._rng = np.random.Generator(np.random.PCG64(seed))
@@ -240,6 +294,12 @@ class TimingEngine:
 
         self.prev_key: Optional[str] = None
         self._prev_dwell: Optional[float] = None
+
+        # Within-document dynamics state: elapsed active-typing time summed
+        # from the emitted intervals (the engine has no other clock), and the
+        # digraphs typed so far in this document.
+        self._active_ms = 0.0
+        self._familiar_digraphs: set = set()
 
     def _solve_latent_variance(self, var_base: float, rho_base: float) -> None:
         """Set the AR(1) variance that yields the target autocorrelation."""
@@ -274,9 +334,16 @@ class TimingEngine:
         """
         logs = []
         prev: Optional[str] = None
+        # A private familiarity cache: the emitted base sequence depends on
+        # which digraphs repeat, so the calibration walk has to track them to
+        # measure it. Kept separate from self._familiar_digraphs, which only
+        # fills once generation actually runs.
+        seen: set = set()
         for char in chars:
             if prev is not None:
-                logs.append(math.log(self._effective_base(prev, char)))
+                logs.append(math.log(self._effective_base(prev, char, seen)))
+                if self.familiarity_boost > 0.0:
+                    seen.add(self._base_key(prev) + self._base_key(char))
             prev = char
 
         if len(logs) < 30:
@@ -408,18 +475,47 @@ class TimingEngine:
         """Redraw the latent speed from its stationary distribution.
 
         Called after a session gap, where the typist returns in an unrelated
-        state.
+        state. The fatigue and warmup clock restarts with the new session -
+        the typist has rested - while the familiarity cache persists: it
+        belongs to the document, not to the sitting.
         """
         self._a = float(self._rng.normal(0.0, self.sigma_a)) if self.sigma_a > 0 else 0.0
+        self._active_ms = 0.0
 
-    def _effective_base(self, prev_char: str, char: str) -> float:
-        """Base interval for a digraph, including bigram and shift effects."""
+    def _effective_base(
+        self, prev_char: str, char: str, seen: Optional[set] = None
+    ) -> float:
+        """Base interval for a digraph, including bigram and shift effects.
+
+        `seen` is the set of digraphs already typed in this document; a
+        repeated digraph gets the familiarity speedup. Callers with no
+        document state (isolated digraph probes) leave it None.
+        """
         base = self._base_delay(prev_char, char)
-        if self._base_key(prev_char) + self._base_key(char) in COMMON_BIGRAMS:
+        digraph = self._base_key(prev_char) + self._base_key(char)
+        if digraph in COMMON_BIGRAMS:
             base *= (1.0 - SPEED_BOOST_BIGRAM)
         if self._needs_shift(char):
             base *= SHIFT_PENALTY
+        if seen is not None and digraph in seen:
+            base *= (1.0 - self.familiarity_boost)
         return base
+
+    def _within_document_factor(self) -> float:
+        """Warmup and fatigue multiplier for the next interval.
+
+        Both are driven by the elapsed active-typing time the engine has
+        summed so far: warmup slows the start of the document and decays away,
+        fatigue inflates intervals linearly at FATIGUE_RATE per ten minutes.
+        """
+        factor = 1.0
+        if self.warmup_strength > 0.0:
+            factor *= 1.0 + self.warmup_strength * math.exp(
+                -self._active_ms / WARMUP_TAU_MS
+            )
+        if self.fatigue_rate > 0.0:
+            factor *= 1.0 + self.fatigue_rate * (self._active_ms / 600_000.0)
+        return factor
 
     def next_keystroke(self, char: str) -> KeyTiming:
         """Timing for typing `char` given everything typed so far."""
@@ -432,10 +528,16 @@ class TimingEngine:
             if self._needs_shift(char):
                 base *= SHIFT_PENALTY
         else:
-            base = self._effective_base(self.prev_key, char)
+            base = self._effective_base(
+                self.prev_key, char, self._familiar_digraphs
+            )
+            if self.familiarity_boost > 0.0:
+                self._familiar_digraphs.add(
+                    self._base_key(self.prev_key) + self._base_key(char)
+                )
 
         iki = math.exp(math.log(base) + a + e)
-        iki *= self.multiplier * WPM_CALIBRATION
+        iki *= self.multiplier * WPM_CALIBRATION * self._within_document_factor()
         iki = max(MIN_IKI_MS, iki)
 
         dwell = self._sample_dwell() * self.multiplier
@@ -459,4 +561,7 @@ class TimingEngine:
 
         self.prev_key = char
         self._prev_dwell = dwell
+        # The fatigue and warmup clocks run on active-typing time; deliberate
+        # pauses live in the pipeline and never reach this sum.
+        self._active_ms += iki
         return KeyTiming(iki_ms=iki, dwell_ms=dwell, prev_overlap_ms=overlap)

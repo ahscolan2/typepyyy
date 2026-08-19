@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 import macro_scripter as ms
+import timing_engine as te
 from macro_scripter import MacroScripter, ScriptEvent
 from timing_engine import BACKSPACE, TimingEngine
 
@@ -331,6 +332,10 @@ def generate(
     r_burst_probability: float = ms.R_BURST_PROBABILITY,
     session_chars: Optional[int] = None,
     target_autocorrelation: Optional[float] = None,
+    structural_revision_rate: float = ms.STRUCTURAL_REVISION_RATE,
+    fatigue_rate: float = te.FATIGUE_RATE,
+    warmup_strength: float = te.WARMUP_STRENGTH,
+    familiarity_boost: float = te.FAMILIARITY_BOOST,
 ) -> dict:
     """Generate the full synthetic record for `text`.
 
@@ -344,9 +349,16 @@ def generate(
         seed=seed,
         typo_rate=typo_rate,
         r_burst_probability=r_burst_probability,
+        structural_revision_rate=structural_revision_rate,
         session_chars=session_chars,
     )
-    engine_kwargs = {"profile": profile, "seed": seed}
+    engine_kwargs = {
+        "profile": profile,
+        "seed": seed,
+        "fatigue_rate": fatigue_rate,
+        "warmup_strength": warmup_strength,
+        "familiarity_boost": familiarity_boost,
+    }
     if target_autocorrelation is not None:
         engine_kwargs["target_autocorrelation"] = target_autocorrelation
     engine = TimingEngine(**engine_kwargs)

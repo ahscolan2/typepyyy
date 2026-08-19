@@ -322,7 +322,8 @@ def test_r_burst_probability_one_produces_revisions(long_prose):
 
 def test_no_deletions_without_typos_or_revisions(long_prose):
     script = MacroScripter(
-        seed=3, typo_rate=0.0, r_burst_probability=0.0
+        seed=3, typo_rate=0.0, r_burst_probability=0.0,
+        structural_revision_rate=0.0,
     ).generate_script(long_prose)
 
     assert [e for e in script if e.op == ms.OP_DELETE] == []
@@ -378,6 +379,133 @@ def test_burst_ranges_are_ordered():
     # An R-burst is by definition the shorter one; if the ranges ever cross,
     # the "revision burst" name stops meaning anything.
     assert ms.R_BURST_RANGE[1] < ms.P_BURST_RANGE[0]
+
+
+# --- structural (sentence-scale) revision --------------------------------------
+
+
+def _revision_spans(text, script):
+    """(deleted span, retyped string) for every revision event in `script`."""
+    spans = []
+    for index, event in enumerate(script):
+        if event.op != ms.OP_DELETE or event.role != ms.ROLE_REVISION_DELETE:
+            continue
+        # Measure the buffer as it stood just before the delete, directly.
+        buffer = []
+        for prior in script[:index]:
+            if prior.op == ms.OP_TYPE:
+                buffer.append(prior.char)
+            elif prior.op == ms.OP_DELETE:
+                del buffer[-prior.count:]
+        deleted = text[len(buffer) - event.count:len(buffer)]
+        retyped = "".join(
+            e.char
+            for e in script[index + 1:]
+            if e.op == ms.OP_TYPE and e.role == ms.ROLE_REVISION_RETYPE
+        )[:event.count]
+        spans.append((deleted, retyped))
+    return spans
+
+
+def test_structural_revision_deletes_a_whole_sentence_and_retypes_it():
+    sentences = [
+        "First sentence ends here.",
+        "Second sentence ends there.",
+    ]
+    text = " ".join(sentences)
+    script = MacroScripter(
+        seed=11, typo_rate=0.0, r_burst_probability=0.0,
+        structural_revision_rate=1.0,
+    ).generate_script(text)
+
+    spans = _revision_spans(text, script)
+    # Every completed sentence is revised once, whole, at rate 1.0.
+    assert [deleted for deleted, _ in spans] == sentences
+    # The retype emits the identical characters, which is what keeps the
+    # replay invariant true by construction.
+    assert all(deleted == retyped for deleted, retyped in spans)
+    assert replay(script) == text
+
+
+def test_structural_revision_crosses_the_burst_boundary():
+    # One 16-word sentence cannot fit inside any burst (they run 3-13 words),
+    # so a delete covering the whole sentence necessarily crosses the boundary
+    # of the burst that produced it.
+    sentence = (
+        "this old house has four tall oak trees and "
+        "deep soft green grass all year round."
+    )
+    script = MacroScripter(
+        seed=3, typo_rate=0.0, r_burst_probability=0.0,
+        structural_revision_rate=1.0,
+    ).generate_script(sentence)
+
+    deletes = [
+        e for e in script
+        if e.op == ms.OP_DELETE and e.role == ms.ROLE_REVISION_DELETE
+    ]
+    assert len(deletes) == 1
+    assert deletes[0].count == len(sentence)
+    words = sentence.split()
+    window = ms.P_BURST_RANGE[1]
+    largest_burst_span = max(
+        sum(len(word) + 1 for word in words[i:i + window]) - 1
+        for i in range(len(words) - window + 1)
+    )
+    assert deletes[0].count > largest_burst_span
+    assert replay(script) == sentence
+
+
+def test_structural_revision_can_cross_a_paragraph_break(monkeypatch):
+    # Reach back over a blank line to rework the paragraph's trailing sentence.
+    monkeypatch.setattr(ms, "STRUCTURAL_BACK_ACROSS_PARAGRAPH", 1.0)
+    text = "One two three.\n\nFour five six. Seven eight nine ten."
+    script = MacroScripter(
+        seed=1, typo_rate=0.0, r_burst_probability=0.0,
+        structural_revision_rate=1.0,
+    ).generate_script(text)
+
+    spans = _revision_spans(text, script)
+    assert spans, "structural_revision_rate=1.0 produced no revision"
+    assert any("\n\n" in deleted for deleted, _ in spans)
+    assert all(deleted == retyped for deleted, retyped in spans)
+    assert replay(script) == text
+
+
+def test_replay_holds_with_structural_revisions_forced(corpus):
+    scripter = MacroScripter(
+        seed=5, structural_revision_rate=1.0, r_burst_probability=0.3
+    )
+    for index, text in enumerate(corpus[::7]):
+        assert replay(scripter.generate_script(text)) == text, (
+            f"corpus[{index * 7}] failed: {text!r}"
+        )
+
+
+def test_same_seed_gives_an_identical_script_with_structural_revisions(long_prose):
+    first = MacroScripter(
+        seed=42, structural_revision_rate=0.5
+    ).generate_script(long_prose)
+    second = MacroScripter(
+        seed=42, structural_revision_rate=0.5
+    ).generate_script(long_prose)
+    assert first == second
+
+
+@pytest.mark.parametrize(
+    "structural_revision_rate", [-0.001, -1.0, 1.001, 2.0, float("nan")]
+)
+def test_invalid_structural_revision_rate_is_rejected(structural_revision_rate):
+    with pytest.raises(ValueError, match="structural_revision_rate"):
+        MacroScripter(structural_revision_rate=structural_revision_rate)
+
+
+def test_paragraph_trailing_detection():
+    probe = MacroScripter._paragraph_trailing
+    assert probe("One.\n\nTwo.", 0, 6)
+    assert not probe("One. Two.", 0, 5)
+    assert probe("One.\r\n\r\nTwo.", 0, 8)
+    assert not probe("One.\nTwo.", 0, 5)
 
 
 # --- sessions ----------------------------------------------------------------

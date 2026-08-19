@@ -37,6 +37,24 @@ P_BURST_RANGE = (8, 13)
 R_BURST_RANGE = (3, 7)
 R_BURST_PROBABILITY = 0.20
 
+# Probability, rolled at each completed sentence, that the writer deletes the
+# whole sentence back and retypes it verbatim. This is the sentence/paragraph
+# scale of revision that the R-burst below does not cover: the deletion is
+# measured from the sentence's start, so it reaches back across the boundary
+# of the burst that produced it, and across a paragraph break when the
+# sentence trails one. The retype emits the identical characters from the
+# target text, so the replay invariant holds by construction. 0 disables it.
+#
+# 0.08 is a model choice, not a literature figure: the sources behind the
+# other constants do not pin down a sentence-scale revision rate, and this is
+# picked small enough that roughly one sentence in twelve is reworked.
+STRUCTURAL_REVISION_RATE = 0.08
+
+# When a structural revision fires and the previous sentence was the trailing
+# sentence of the paragraph before this one, the chance the writer reaches
+# back over the paragraph break to rework that sentence instead. Model choice.
+STRUCTURAL_BACK_ACROSS_PARAGRAPH = 0.3
+
 # Lognormal pause parameters (mu, sigma) on log-milliseconds. Medians are
 # exp(mu): 90ms, 181ms, 493ms, 1097ms respectively. Verified in
 # tests/test_macro_scripter.py::test_pause_medians.
@@ -55,14 +73,12 @@ TYPO_RATE = 0.03
 
 # Fraction of a completed R-burst that gets deleted and retyped.
 #
-# With R_BURST_PROBABILITY at the cited 0.20 this yields an overall deletion
-# ratio of roughly 0.09 - just below the 0.10-0.30 range reported for real
-# composition. The shortfall is a known limitation of the model, not a
-# mis-tuning: revision here is local to the burst just written, and does not
-# include the structural rewriting (deleting and reworking whole sentences or
-# paragraphs) that makes up much of the deletion in real writing. Raising
-# r_burst_probability to ~0.25 brings the ratio into the reported range if a
-# consumer would rather match the aggregate than the cited burst rate.
+# With R_BURST_PROBABILITY at the cited 0.20, this burst-local revision alone
+# yields a deletion ratio of roughly 0.09; STRUCTURAL_REVISION_RATE adds the
+# sentence-scale deletion on top, bringing the combined ratio into the
+# 0.10-0.30 range reported for real composition. Raising r_burst_probability
+# higher is not the way to get there: burst-local deletion is mechanically
+# capped by the burst it revises.
 REVISION_FRACTION_RANGE = (0.4, 1.0)
 
 # A writing session runs 20-90 minutes. Converted to characters using a nominal
@@ -202,6 +218,7 @@ class MacroScripter:
         typo_rate: float = TYPO_RATE,
         r_burst_probability: float = R_BURST_PROBABILITY,
         session_chars: Optional[int] = None,
+        structural_revision_rate: float = STRUCTURAL_REVISION_RATE,
     ):
         if not 0.0 <= typo_rate <= 1.0:
             raise ValueError(f"typo_rate must be in [0, 1], got {typo_rate}")
@@ -209,12 +226,18 @@ class MacroScripter:
             raise ValueError(
                 f"r_burst_probability must be in [0, 1], got {r_burst_probability}"
             )
+        if not 0.0 <= structural_revision_rate <= 1.0:
+            raise ValueError(
+                "structural_revision_rate must be in [0, 1], got "
+                f"{structural_revision_rate}"
+            )
         if session_chars is not None and session_chars <= 0:
             raise ValueError(f"session_chars must be positive, got {session_chars}")
 
         self._rng = random.Random(seed)
         self.typo_rate = typo_rate
         self.r_burst_probability = r_burst_probability
+        self.structural_revision_rate = structural_revision_rate
         self.session_chars = session_chars
 
     # -- sampling ------------------------------------------------------------
@@ -276,6 +299,17 @@ class MacroScripter:
             break
         return "word"
 
+    @staticmethod
+    def _paragraph_trailing(text: str, sentence_start: int, next_start: int) -> bool:
+        """True if the sentence at `sentence_start` trails its paragraph.
+
+        Everything between two consecutive sentence starts is whitespace by
+        construction, so a blank line in that span can only mean the earlier
+        sentence ended its paragraph.
+        """
+        between = text[sentence_start:next_start].replace("\r", "")
+        return "\n\n" in between
+
     # -- script construction -------------------------------------------------
 
     def generate_script(self, text: str) -> List[ScriptEvent]:
@@ -302,6 +336,12 @@ class MacroScripter:
         burst_start = 0
 
         pending_context: Optional[str] = None
+
+        # Offsets where each sentence in the target text began, so a
+        # structural revision can delete one back whole rather than stopping
+        # at the burst boundary.
+        sentence_starts: List[int] = []
+        sentence_opens = True
 
         for index, token in enumerate(tokens):
             is_whitespace = token.isspace()
@@ -337,7 +377,14 @@ class MacroScripter:
                 pending_context = None
                 continue
 
-            # Word token. If the burst is finished, pause and start a new one -
+            # Word token. The first word token of a sentence fixes where that
+            # sentence began, before any revision at the burst boundary can
+            # move the burst start.
+            if sentence_opens:
+                sentence_starts.append(committed)
+                sentence_opens = False
+
+            # If the burst is finished, pause and start a new one -
             # possibly revising what was just written first.
             if words_in_burst >= burst_limit:
                 if is_r_burst and committed > burst_start:
@@ -375,6 +422,34 @@ class MacroScripter:
 
             words_in_burst += 1
             pending_context = self._context_after(token)
+            if pending_context == "sentence":
+                sentence_opens = True
+
+            # A completed sentence is eligible for a structural revision:
+            # delete it back whole - across the burst boundary, and sometimes
+            # across a paragraph break when the previous sentence trailed one -
+            # and retype it verbatim. The rate check comes first so a disabled
+            # rate consumes no randomness and the stream above is undisturbed.
+            if (
+                pending_context == "sentence"
+                and self.structural_revision_rate > 0.0
+                and committed > sentence_starts[-1]
+                and self._rng.random() < self.structural_revision_rate
+            ):
+                span_start = sentence_starts[-1]
+                if (
+                    len(sentence_starts) > 1
+                    and self._paragraph_trailing(
+                        text, sentence_starts[-2], sentence_starts[-1]
+                    )
+                    and self._rng.random() < STRUCTURAL_BACK_ACROSS_PARAGRAPH
+                ):
+                    span_start = sentence_starts[-2]
+                events.extend(self._revise(text, span_start, committed, 1.0))
+                # The retype is its own burst of work; the meter restarts.
+                burst_limit, is_r_burst = self._burst_limit()
+                words_in_burst = 0
+                burst_start = committed
 
         return events
 
@@ -384,18 +459,29 @@ class MacroScripter:
         hours *= self._rng.uniform(0.85, 1.15)
         return hours * 3_600_000.0
 
-    def _revise(self, text: str, burst_start: int, committed: int) -> List[ScriptEvent]:
-        """Delete back into the just-written burst and retype it.
+    def _revise(
+        self,
+        text: str,
+        span_start: int,
+        committed: int,
+        fraction: Optional[float] = None,
+    ) -> List[ScriptEvent]:
+        """Delete back over a span of the target text and retype it verbatim.
 
-        This is what makes an R-burst a revision burst rather than just a short
-        one. The deleted span is retyped verbatim from the target text, so the
-        buffer ends where it started and the replay invariant holds.
+        For an R-burst `span_start` is where the burst began and the deleted
+        fraction is sampled from REVISION_FRACTION_RANGE; for a structural
+        revision `span_start` is where the sentence began and the whole
+        sentence goes (fraction 1.0), which may lie several bursts - or one
+        paragraph break - before the current position. Either way the deleted
+        span is retyped verbatim from the target text, so the buffer ends
+        where it started and the replay invariant holds.
         """
-        span = committed - burst_start
+        span = committed - span_start
         if span <= 0:
             return []
 
-        fraction = self._rng.uniform(*REVISION_FRACTION_RANGE)
+        if fraction is None:
+            fraction = self._rng.uniform(*REVISION_FRACTION_RANGE)
         delete_count = max(1, min(span, int(round(span * fraction))))
 
         retyped = text[committed - delete_count:committed]
