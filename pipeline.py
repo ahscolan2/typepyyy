@@ -18,6 +18,7 @@ Here there is one event list, one clock, and one invariant:
 """
 
 import math
+import secrets
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -170,6 +171,26 @@ def build_timeline(
             continue
 
         if event.op == ms.OP_SESSION_GAP:
+            # A pause accumulated before the gap is flushed here, at its own
+            # anchor, rather than left pending. Held over, the next keystroke
+            # would merge it with any pause after the gap into one interval
+            # anchored before the gap - a span overlapping the gap itself.
+            if pending_pause_ms > 0.0 and timeline.events:
+                timeline.intervals.append(
+                    Interval(
+                        kind="pause",
+                        start_ms=(
+                            pause_start_ms
+                            if pause_start_ms is not None
+                            else timeline.events[-1].keyup_ms
+                        ),
+                        duration_ms=pending_pause_ms,
+                        role=event.role,
+                    )
+                )
+            pending_pause_ms = 0.0
+            pause_start_ms = None
+
             start = last_keydown if last_keydown is not None else 0.0
             start = timeline.events[-1].keyup_ms if timeline.events else start
             timeline.intervals.append(
@@ -383,6 +404,16 @@ def generate(
     """
     if not isinstance(text, str):
         raise TypeError(f"text must be str, got {type(text).__name__}")
+
+    # An unseeded run draws its seed here and records it, for the same reason
+    # target_autocorrelation below records the engine's resolved value rather
+    # than None: the metadata block promises that a record can be regenerated
+    # from its own metadata, and "seed": null cannot keep that promise - the
+    # scripter and the engine would each reseed from OS entropy and produce a
+    # different record. Two unseeded runs still differ, because each draws its
+    # own seed.
+    if seed is None:
+        seed = secrets.randbelow(2**32)
 
     scripter = MacroScripter(
         seed=seed,

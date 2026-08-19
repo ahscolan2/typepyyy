@@ -291,13 +291,33 @@ def test_silences_never_sum_past_the_elapsed_time(gappy_record):
 
 
 def test_gap_time_is_only_counted_as_gap_time(gappy_record):
-    gap_ms = sum(
+    """Gap durations agree across the record's three representations.
+
+    The macro script is the generator's account of what happened, the
+    interval list is the timeline's, and session_gap_ms is the statistics
+    block's - each is written by different code, so comparing all three
+    catches a leak in any of them. (Comparing intervals against
+    session_gap_ms alone would be vacuous: both reduce timeline.intervals.)
+    """
+    script_gap_ms = sum(
+        op["duration_ms"]
+        for op in gappy_record["macro_script"]
+        if op["op"] == "SESSION_GAP"
+    )
+    interval_gap_ms = sum(
         i["duration_ms"]
         for i in gappy_record["intervals"]
         if i["kind"] == "session_gap"
     )
-    assert gap_ms == pytest.approx(
-        gappy_record["statistics"]["session_gap_ms"], abs=0.01
+    assert script_gap_ms > 0.0
+    assert interval_gap_ms == pytest.approx(script_gap_ms, abs=0.01)
+    assert gappy_record["statistics"]["session_gap_ms"] == pytest.approx(
+        script_gap_ms, abs=0.01
+    )
+    # And gap time is exactly the wall-clock minus active-time difference.
+    stats = gappy_record["statistics"]
+    assert stats["total_time_ms"] - stats["active_time_ms"] == pytest.approx(
+        script_gap_ms, abs=0.01
     )
 
 
@@ -599,6 +619,30 @@ def test_metadata_round_trips_back_into_the_same_record(long_prose):
     assert generate(long_prose, **metadata)["keystrokes"] == original["keystrokes"]
 
 
+def test_an_unseeded_record_round_trips_through_its_own_metadata(long_prose):
+    """The metadata promise has to hold for the default invocation too.
+
+    With no seed given, the scripter and the engine each used to reseed from
+    OS entropy while the metadata recorded "seed": null - identical metadata,
+    different records, nothing regenerable. generate() now draws the seed
+    itself and records the drawn value.
+    """
+    original = generate(long_prose)
+    drawn = original["metadata"]["seed"]
+    assert isinstance(drawn, int)
+
+    metadata = dict(original["metadata"])
+    metadata.pop("input_chars")
+    metadata.pop("input_words")
+    assert generate(long_prose, **metadata)["keystrokes"] == original["keystrokes"]
+
+    # Two unseeded runs still differ: each draws its own seed.
+    another = generate(long_prose)
+    assert another["metadata"]["seed"] != drawn or (
+        another["keystrokes"] == original["keystrokes"]
+    )
+
+
 # --- serialisation -----------------------------------------------------------
 
 
@@ -770,3 +814,30 @@ def test_intervals_are_in_time_order_for_a_pause_directly_before_a_gap():
     # And the two silences still do not overlap.
     pause, gap = timeline.intervals
     assert pause.start_ms + pause.duration_ms == pytest.approx(gap.start_ms)
+
+
+def test_pauses_on_both_sides_of_a_gap_stay_disjoint():
+    """A pause before the gap must not swallow a pause after it.
+
+    The pause pending at a gap used to stay pending across it, so the next
+    keystroke flushed both pauses as one interval anchored before the gap -
+    a span overlapping the gap and placing the second pause minutes before
+    it happened. The pending pause is now flushed when the gap arrives.
+    """
+    script = [
+        ScriptEvent(ms.OP_TYPE, char="a"),
+        ScriptEvent(ms.OP_PAUSE, duration_ms=500.0),
+        ScriptEvent(ms.OP_SESSION_GAP, duration_ms=300_000.0),
+        ScriptEvent(ms.OP_PAUSE, duration_ms=700.0),
+        ScriptEvent(ms.OP_TYPE, char="b"),
+    ]
+    timeline = build_timeline(script, TimingEngine(seed=1))
+    kinds = [i.kind for i in timeline.intervals]
+    assert kinds == ["pause", "session_gap", "pause"]
+
+    first, gap, second = timeline.intervals
+    assert first.duration_ms == pytest.approx(500.0)
+    assert second.duration_ms == pytest.approx(700.0)
+    # Disjoint and ordered: each interval ends before the next begins.
+    assert first.start_ms + first.duration_ms == pytest.approx(gap.start_ms)
+    assert gap.start_ms + gap.duration_ms <= second.start_ms + 0.001

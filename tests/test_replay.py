@@ -363,10 +363,17 @@ def test_wall_clock_time_is_reported_only_when_there_are_session_gaps(
     assert "wall clock" in render(gappy_record)
 
 
-def test_a_record_with_no_seed_omits_the_seed_from_the_header():
-    rendered = render(make_record("Hello there.", seed=None))
-    assert "profile    : average\n" in rendered
-    assert "seed" not in rendered
+def test_an_unseeded_record_still_reports_a_concrete_seed():
+    """An unseeded run draws its seed at generation time and records it.
+
+    The header used to omit the seed line, which meant an unseeded record
+    could never be regenerated from what it reported about itself. Now the
+    drawn seed appears exactly like a requested one would.
+    """
+    record = make_record("Hello there.", seed=None)
+    assert isinstance(record["metadata"]["seed"], int)
+    rendered = render(record)
+    assert f"seed {record['metadata']['seed']}" in rendered
 
 
 # --- render: the body --------------------------------------------------------
@@ -429,12 +436,19 @@ def test_a_session_gap_is_not_also_reported_as_a_thinking_pause(gappy_record):
     ]
     assert gap_ms, "the fixture is meant to contain session gaps"
 
+    # The next EVENT after each STOP line must not be a minutes-long pause -
+    # that is the gap being told twice. A genuine sub-second boundary pause
+    # can legitimately sit right after a gap, so only the magnitude is banned.
+    # render() puts a blank line directly after a STOP, so scan forward to the
+    # next line with content rather than trusting position + 1.
     lines = rendered.splitlines()
     for position, line in enumerate(lines):
         if "STOP - " not in line:
             continue
-        following = lines[position + 1] if position + 1 < len(lines) else ""
-        assert "pause" not in following, (
+        following = next(
+            (later for later in lines[position + 1:] if later.strip()), ""
+        )
+        assert not re.search(r"pause [\d.]+ min", following), (
             f"gap reported twice:\n  {line.strip()}\n  {following.strip()}"
         )
 
@@ -444,26 +458,31 @@ def test_a_session_gap_is_not_also_reported_as_a_thinking_pause(gappy_record):
     assert all(float(value) < shortest_gap_min for value in reported)
 
 
-def test_rendering_stays_linear_in_the_length_of_the_document():
+def test_moments_carry_only_the_document_tail():
     """The DOCUMENT column shows a tail, so the whole document must not be
     rebuilt per keystroke.
 
-    Joining the full buffer on every keystroke is quadratic: a 57k-character
-    essay took sixteen seconds to render.
+    Joining the full buffer on every keystroke is quadratic - a 57k-character
+    essay took sixteen seconds to render. Wall-clock ratios cannot pin that
+    down reliably (at test-sized inputs the quadratic version is still fast),
+    so this asserts the structural property the fix actually consists of:
+    every moment stores at most width+1 characters of document, no matter how
+    long the document has grown. A reverted full-buffer join fails this on
+    the first keystroke past the width.
     """
-    import time
-
-    def elapsed(text):
-        built = make_record(text, seed=3)
-        start = time.perf_counter()
-        render(built)
-        return time.perf_counter() - start
-
-    small = elapsed(PROSE_FOR_REPLAY * 8)
-    large = elapsed(PROSE_FOR_REPLAY * 32)
-    # Four times the text. Quadratic would be ~16x; allow generous slack for a
-    # loaded machine but nothing like a quadratic blow-up.
-    assert large < max(small * 8.0, 0.5)
+    width = 40
+    record = make_record(PROSE_FOR_REPLAY * 4, seed=3)
+    assert len(record["target_text"]) > width * 4
+    moments = replay._moments(record, replay.DEFAULT_PAUSE_THRESHOLD_MS, width=width)
+    assert moments, "the record is meant to produce moments"
+    longest = max(len(m["text"]) for m in moments)
+    assert longest <= width + 1, (
+        f"a moment carries {longest} chars of document; the column only "
+        f"shows {width}"
+    )
+    # And the tail is still enough for the renderer: the final moment ends
+    # with the end of the document.
+    assert record["target_text"].endswith(moments[-1]["text"][-width:])
 
 
 def test_pauses_are_reported_once_they_are_long_enough(record):

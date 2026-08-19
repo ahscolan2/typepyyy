@@ -281,9 +281,11 @@ their bands.
 | Common-bigram speedup | 40% faster on 30 frequent English digraphs | model choice |
 | Global interval scale | ×1.7344 on every inter-key interval | calibration, see below |
 
-The last two are applied to the Salthouse baselines rather than replacing them,
-so the effective digraph delays before any other factor are 236 / 291 / 378 ms,
-not 136 / 168 / 218. The scale factor exists because Salthouse measured skilled
+The last two are applied to the Salthouse baselines rather than replacing them.
+The global scale alone puts the effective digraph delays at 236 / 291 / 378 ms
+rather than 136 / 168 / 218; the bigram speedup then acts on top of whichever
+baseline a digraph falls in, so one of the thirty common digraphs runs 40%
+below these figures. The scale factor exists because Salthouse measured skilled
 transcription typists and the target here is the Dhakal population mean; it is
 `WPM_CALIBRATION` in `timing_engine.py` and is what makes the `average` profile
 land near 52 WPM. Neither is a literature value.
@@ -306,8 +308,8 @@ python benchmark.py
 
 | Quantity | Achieved | Target |
 |---|---|---|
-| `average` profile, keystroke clock | 50.0 WPM [47.6, 52.7] | 52 WPM (Dhakal) |
-| `slow` / `fast` profile | 33.1 / 71.2 WPM | relative |
+| `average` profile, keystroke clock | 53.3 WPM [50.2, 59.1] | 52 WPM (Dhakal) |
+| `slow` / `fast` profile | 35.6 / 76.6 WPM | relative |
 | `wpm_active`, whole pipeline | 33.3 [22.4, 43.7] | lower than above; composition pauses and revisions count |
 | Mean dwell | 117.5 ms [116.6, 118.5] | 116 plus genuine rollover extension |
 | Mean motor interval | 240.5 ms [227.8, 252.0] | — |
@@ -376,8 +378,9 @@ know where the two come apart.
   interaction with autocorrect or spellcheck. Real keystroke logs are full of
   all of these.
 - **Errors are single-character neighbour substitutions**, corrected
-  immediately, on lowercase letters only — no transpositions, omissions,
-  doubling, or errors noticed several characters later. `error_models.py` in
+  immediately, on letters only (uppercase included, case preserved; digits,
+  punctuation and whitespace are never mistyped) — no transpositions,
+  omissions, doubling, or errors noticed several characters later. `error_models.py` in
   this repository implements a wider taxonomy (anticipations, perseverations,
   exchanges, stutters, homophone confusions), but it is a standalone library:
   nothing in the CLI, GUI or pipeline imports it, and its own docstring says

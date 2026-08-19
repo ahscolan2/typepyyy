@@ -9,7 +9,9 @@ those numbers, so a reader had no way to check them and a change that moved
 them had no way to announce itself.
 
     python benchmark.py            # both tables
-    python benchmark.py --seeds 80 # tighter intervals, slower
+    python benchmark.py --seeds 80 # steadier means, slower; the bracketed
+                                   # bands are min-max, so more seeds can only
+                                   # widen them
 
 Everything here is measured through pipeline.generate at default settings, so
 what it reports is what the CLI produces. It writes nothing.
@@ -63,13 +65,21 @@ def interval(values: Sequence[float]) -> str:
     return f"{statistics.mean(values):.1f} [{min(values):.1f}, {max(values):.1f}]"
 
 
-def keystroke_wpm(record: dict) -> float:
-    """WPM on the keystroke clock alone: motor intervals, no pauses or gaps."""
-    motor = [k["motor_iki_ms"] for k in record["keystrokes"] if k["motor_iki_ms"] > 0.0]
-    if not motor:
-        return 0.0
-    minutes = sum(motor) / 60_000.0
-    return (len(record["keystrokes"]) / 5.0) / minutes
+def keystroke_wpm(text: str, profile: str, seed: int) -> float:
+    """WPM on the keystroke clock: transcription through the engine alone.
+
+    This is the quantity the Dhakal 52 WPM population mean measures - words of
+    produced text over typing time - so it is computed the way the engine's own
+    test does: the text typed straight through, no typos, no revisions, chars/5
+    over the summed motor intervals. Dividing the full pipeline's keystroke
+    count by its motor clock instead would count backspaces and retyped
+    characters as words, which is not any WPM convention.
+    """
+    engine = te.TimingEngine(profile=profile, seed=seed)
+    engine.calibrate(text)
+    timings = [engine.next_keystroke(char) for char in text]
+    elapsed_ms = sum(t.iki_ms for t in timings[1:]) + timings[-1].dwell_ms
+    return (len(text) / 5.0) / (elapsed_ms / 60_000.0)
 
 
 def achieved(seeds: int, text: str) -> None:
@@ -80,7 +90,7 @@ def achieved(seeds: int, text: str) -> None:
     for seed in range(seeds):
         record = pipeline.generate(text, seed=seed)
         stats = record["statistics"]
-        rows["keystroke_wpm"].append(keystroke_wpm(record))
+        rows["keystroke_wpm"].append(keystroke_wpm(text, "average", seed))
         rows["wpm_active"].append(stats["wpm_active"])
         rows["mean_dwell_ms"].append(stats["mean_dwell_ms"])
         rows["mean_motor_iki_ms"].append(stats["mean_motor_iki_ms"])
@@ -93,8 +103,7 @@ def achieved(seeds: int, text: str) -> None:
     profiles = {}
     for profile in ("slow", "fast"):
         profiles[profile] = statistics.mean(
-            keystroke_wpm(pipeline.generate(text, profile=profile, seed=seed))
-            for seed in range(seeds)
+            keystroke_wpm(text, profile, seed) for seed in range(seeds)
         )
 
     print(f"Achieved, {seeds} seeds, {len(text)} chars of English prose, defaults")

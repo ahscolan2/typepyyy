@@ -141,11 +141,26 @@ def _moments(
     gaps = [i for i in record.get("intervals", []) if i["kind"] == "session_gap"]
     keep = max(width, 0) + 1
 
+    # Thinking pauses come from the record's own interval list, which the
+    # pipeline writes in time order, one entry per pause, gaps excluded.
+    # Deriving them from iki_ms - motor_iki_ms instead goes wrong at a session
+    # boundary twice over: the difference contains the whole gap (already
+    # reported on its own STOP line), and motor_iki_ms is a sentinel 0.0 on the
+    # resuming keystroke, so what is left over after subtracting the gap is
+    # that keystroke's motor interval masquerading as thought. The derivation
+    # survives below only for a record with no interval list at all.
+    pauses = (
+        [i for i in record["intervals"] if i["kind"] == "pause"]
+        if "intervals" in record
+        else None
+    )
+    pause_index = 0
+
     moments: List[dict] = []
     buffer: List[str] = []
     gap_index = 0
-    # Duration of a session gap that has been reported but whose silence is
-    # still sitting in the resuming keystroke's iki_ms.
+    # Fallback bookkeeping only: duration of a session gap that has been
+    # reported but whose silence is still sitting in the next iki_ms.
     gap_carry_ms = 0.0
 
     for position, event in enumerate(keystrokes):
@@ -168,14 +183,23 @@ def _moments(
             buffer.append(event["char"])
 
         role = event["role"]
-        # motor_iki_ms is zeroed on the keystroke that resumes after a gap, so
-        # the difference here would otherwise be the whole gap - and the gap
-        # has already had its own STOP line. Reporting it again as a thinking
-        # pause is the same silence told twice.
-        pause_ms = event["iki_ms"] - event["motor_iki_ms"] - gap_carry_ms
-        gap_carry_ms = 0.0
-        if pause_ms < 0.0:
+        if pauses is not None:
+            # Every pause interval that ended before this keydown belongs to
+            # this keystroke: the pipeline flushes a pause when the keystroke
+            # that ends it lands, so its start always precedes that keydown.
             pause_ms = 0.0
+            while (
+                pause_index < len(pauses)
+                and pauses[pause_index]["start_ms"] < event["keydown_ms"]
+            ):
+                pause_ms += pauses[pause_index]["duration_ms"]
+                pause_index += 1
+            gap_carry_ms = 0.0
+        else:
+            pause_ms = event["iki_ms"] - event["motor_iki_ms"] - gap_carry_ms
+            gap_carry_ms = 0.0
+            if pause_ms < 0.0:
+                pause_ms = 0.0
 
         if position == 0:
             kind = "begin"
