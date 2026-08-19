@@ -1,12 +1,15 @@
 """
-Project Aletheia - Command line interface.
+Project TypeTrace - Command line interface.
 
 Generates synthetic writing-process datasets: keystroke-level records of how a
 piece of text could plausibly have been typed, for training and evaluating
 detectors of machine-generated writing.
 
-This tool writes data files. It does not drive a browser or interact with any
-document, and has no network access.
+This tool writes data files. Optionally (--emit) it can also replay a finished
+record into a real document editor owned by the user - a Google Doc in the
+user's own browser profile, or the focused desktop window - so researchers can
+study what those editors record. That replay is an optional extra with its own
+dependencies (playwright or pynput); the generator itself needs only numpy.
 """
 
 import argparse
@@ -22,7 +25,7 @@ import pipeline
 # Every record carries this so generated data can always be identified as
 # synthetic, wherever it ends up.
 WATERMARK = {
-    "generated_by": "Aletheia-Research",
+    "generated_by": "TypeTrace-Research",
     "purpose": "detection_training",
     "synthetic_research_data": True,
     "schema_version": 2,
@@ -85,7 +88,7 @@ def render_record(record: dict, output_format: str) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="aletheia",
+        prog="typetrace",
         description=(
             "Generate synthetic writing-process data (keystroke timings, "
             "pauses, typos, revisions) for detector training."
@@ -96,6 +99,8 @@ Examples:
   python main.py --text "Hello world."
   python main.py --text @essay.txt --profile fast --seed 42
   python main.py --text @essay.txt --output record.json
+  python main.py --text @essay.txt --emit docs --doc-id 1AbCdEfGh
+  python main.py --text @essay.txt --emit desktop
         """,
     )
     parser.add_argument(
@@ -157,13 +162,86 @@ Examples:
         "--verbose", "-v", action="store_true",
         help="Print a summary to stderr",
     )
+    parser.add_argument(
+        "--emit", choices=["docs", "desktop"], default=None,
+        help=(
+            "After writing the record, replay it live: 'docs' types it into "
+            "the Google Doc named by --doc-id, 'desktop' types it into the "
+            "focused window of this machine. Optional feature; needs the "
+            "matching extra (pip install '.[docs]' or '.[desktop]'). "
+            "Default: off."
+        ),
+    )
+    parser.add_argument(
+        "--doc-id", default=None,
+        help="Google Docs document ID; required with --emit docs",
+    )
+    parser.add_argument(
+        "--emit-speed", type=float, default=1.0,
+        help="Playback speed multiplier for --emit (default: 1.0)",
+    )
+    parser.add_argument(
+        "--emit-max-gap-s", type=float, default=None,
+        help=(
+            "Shorten silences longer than this to exactly this many seconds "
+            "during --emit (default: keep the record's faithful timing)"
+        ),
+    )
+    parser.add_argument(
+        "--headless", action="store_true",
+        help=(
+            "Run the browser without a window for --emit docs. Logging into "
+            "Google needs a visible window, so run once without this flag."
+        ),
+    )
+    parser.add_argument(
+        "--browser-profile", default=".typetrace-browser-profile",
+        help=(
+            "Persistent browser profile directory for --emit docs, so the "
+            "Google login survives between runs (default: "
+            ".typetrace-browser-profile)"
+        ),
+    )
     return parser
+
+
+def emit_record(record: dict, args: argparse.Namespace) -> dict:
+    """Replay `record` into a live editor, per the --emit CLI options.
+
+    The emitters and their dependencies (playwright for Google Docs, pynput
+    for the desktop) are optional, so they are imported here, only when
+    emission was actually requested. A missing dependency comes back as an
+    ImportError telling the user what to pip install.
+    """
+    if args.emit == "docs":
+        if not args.doc_id:
+            raise ValueError("--doc-id is required with --emit docs")
+        import docs_emitter
+
+        return docs_emitter.emit_to_google_docs(
+            record,
+            doc_id=args.doc_id,
+            speed=args.emit_speed,
+            max_gap_s=args.emit_max_gap_s,
+            headless=args.headless,
+            profile_dir=args.browser_profile,
+        )
+    import desktop_emitter
+
+    return desktop_emitter.emit_to_desktop(
+        record,
+        speed=args.emit_speed,
+        max_gap_s=args.emit_max_gap_s,
+    )
 
 
 def main(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
 
     try:
+        if args.emit == "docs" and not args.doc_id:
+            raise ValueError("--doc-id is required with --emit docs")
+
         text = load_text(args.text)
 
         if not text:
@@ -205,8 +283,13 @@ def main(argv: Optional[list] = None) -> int:
                 file=sys.stderr,
             )
 
+        if args.emit:
+            summary = emit_record(record, args)
+            print(f"emission: {summary}", file=sys.stderr)
+
     except (
-        FileNotFoundError, FileExistsError, ValueError, TypeError, OSError
+        FileNotFoundError, FileExistsError, ValueError, TypeError, OSError,
+        ImportError,
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

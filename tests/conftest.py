@@ -1,4 +1,4 @@
-"""Shared fixtures for the Aletheia test suite.
+"""Shared fixtures for the TypeTrace test suite.
 
 The central invariant of this project is that a generated script, replayed,
 reproduces the target text exactly. Testing it needs a corpus wide enough to

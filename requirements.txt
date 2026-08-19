@@ -6,3 +6,8 @@
 numpy>=1.24.0
 
 pytest>=7.4.0
+
+# Optional emitter dependencies, used only by "python main.py --emit ...".
+# The generator itself imports neither; uncomment only if you use --emit.
+# playwright>=1.40   # --emit docs; also run: playwright install chromium
+# pynput>=1.7        # --emit desktop

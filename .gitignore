@@ -28,6 +28,9 @@ datasets/
 .idea/
 .DS_Store
 
+# Persistent browser profile used by --emit docs to keep the Google login.
+.typetrace-browser-profile/
+
 # Scratch
 *.log
 *.tmp
