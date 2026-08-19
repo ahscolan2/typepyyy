@@ -9,8 +9,11 @@ through to the emitter modules only when they are requested.
 """
 
 import json
+import os
+import subprocess
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
@@ -97,6 +100,7 @@ def test_help_lists_the_emit_options():
 
 
 def test_defaults_match_the_library_defaults():
+    import timing_engine as te
     import macro_scripter as ms
 
     args = build_parser().parse_args(["-t", "x"])
@@ -104,6 +108,10 @@ def test_defaults_match_the_library_defaults():
     assert args.seed is None
     assert args.typo_rate == ms.TYPO_RATE
     assert args.r_burst_probability == ms.R_BURST_PROBABILITY
+    assert args.structural_revision_rate == ms.STRUCTURAL_REVISION_RATE
+    assert args.fatigue_rate == te.FATIGUE_RATE
+    assert args.warmup_strength == te.WARMUP_STRENGTH
+    assert args.familiarity_boost == te.FAMILIARITY_BOOST
     assert args.session_chars is None
     assert args.target_autocorrelation is None
     assert args.force is False
@@ -114,6 +122,43 @@ def test_defaults_match_the_library_defaults():
     assert args.emit_max_gap_s is None
     assert args.headless is False
     assert args.browser_profile == ".typetrace-browser-profile"
+
+
+# --- model flags ---------------------------------------------------------------
+
+
+def test_help_lists_the_model_flags():
+    help_text = build_parser().format_help()
+    for flag in (
+        "--structural-revision-rate", "--fatigue-rate",
+        "--warmup-strength", "--familiarity-boost",
+    ):
+        assert flag in help_text
+
+
+def test_the_model_flags_are_accepted(capsys):
+    assert main.main([
+        "--text", "Model flags. They parse.",
+        "--seed", "1", "--structural-revision-rate", "0.4",
+        "--fatigue-rate", "0.05", "--warmup-strength", "0.2",
+        "--familiarity-boost", "0.1",
+    ]) == 0
+    record = json.loads(capsys.readouterr().out)
+    assert record["target_text"] == "Model flags. They parse."
+
+
+@pytest.mark.parametrize(
+    "flag,value",
+    [
+        ("--structural-revision-rate", "2"),
+        ("--fatigue-rate", "-1"),
+        ("--warmup-strength", "1"),
+        ("--familiarity-boost", "1"),
+    ],
+)
+def test_an_out_of_range_model_flag_is_rejected(flag, value, capsys):
+    assert main.main(["--text", "Hello.", flag, value]) == 1
+    assert "error" in capsys.readouterr().err
 
 
 # --- optional emitters -------------------------------------------------------
@@ -364,3 +409,49 @@ def test_output_is_written_as_utf8_not_escapes(tmp_path):
     out = tmp_path / "record.json"
     main.main(["--text", "日本語", "--output", str(out), "--seed", "1"])
     assert "日本語" in out.read_text(encoding="utf-8")
+
+
+# --- stdout encoding in a real process ---------------------------------------
+#
+# The record reaches stdout verbatim (json is dumped with ensure_ascii=False),
+# so a console whose locale cannot encode it used to kill the run mid-write
+# and lose the whole record - including as a zero-byte redirect target, the
+# README quickstart. main() now pins stdout to UTF-8. These tests run the CLI
+# as a real subprocess with the parent stream encoding forced to cp1252, the
+# case a Western-European Windows console hits.
+
+MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
+
+
+def _run_cli(*args):
+    env = dict(os.environ, PYTHONIOENCODING="cp1252", PYTHONUTF8="0")
+    return subprocess.run(
+        [sys.executable, str(MAIN_PY), *args],
+        capture_output=True,
+        env=env,
+    )
+
+
+def test_stdout_json_is_utf8_even_when_the_console_is_not():
+    text = "Café ☕ 中文测试 \U0001f600 done."
+    result = _run_cli("--text", text, "--seed", "5")
+    assert result.returncode == 0
+    # Strict on purpose: cp1252-encoded output must fail the test, not be
+    # silently mangled.
+    record = json.loads(result.stdout.decode("utf-8"))
+    assert record["target_text"] == text
+    for piece in ("☕", "中文测试", "\U0001f600"):
+        assert piece in record["target_text"]
+    assert result.stderr == b""
+
+
+def test_stderr_only_failures_carry_no_traceback():
+    for args in (
+        ("--text", "@no-such-file-café-测试.txt"),
+        ("--text", "Hello.", "--typo-rate", "5"),
+    ):
+        result = _run_cli(*args)
+        assert result.returncode == 1
+        assert result.stdout == b""
+        assert b"error:" in result.stderr
+        assert b"Traceback" not in result.stderr

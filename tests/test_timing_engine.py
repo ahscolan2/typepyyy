@@ -506,3 +506,169 @@ def test_reset_speed_is_a_no_op_when_there_is_no_latent_process():
     engine = TimingEngine(seed=1, target_autocorrelation=0.0)
     engine.reset_speed()
     assert engine._a == 0.0
+
+
+# --- within-document dynamics --------------------------------------------------
+
+# Prose long enough that the clocks get somewhere: prose * 30 is roughly forty
+# minutes of active typing, so the fatigue drift (~3% per ten minutes) amounts
+# to ~12% by the end - far above the sampling noise of a few percent on a
+# windowed mean.
+LONG_STREAM_REPEATS = 30
+
+
+@pytest.mark.parametrize(
+    "kwarg,bad",
+    [
+        ("fatigue_rate", -0.001),
+        ("fatigue_rate", float("nan")),
+        ("warmup_strength", -0.001),
+        ("warmup_strength", 1.0),
+        ("familiarity_boost", -0.001),
+        ("familiarity_boost", 1.0),
+    ],
+)
+def test_invalid_within_document_dynamics_are_rejected(kwarg, bad):
+    with pytest.raises(ValueError, match=kwarg):
+        TimingEngine(**{kwarg: bad})
+
+
+@pytest.mark.parametrize("value", [0.0, 0.05, 0.999])
+def test_valid_within_document_dynamics_are_accepted(value):
+    engine = TimingEngine(
+        fatigue_rate=value, warmup_strength=value, familiarity_boost=value
+    )
+    assert engine.fatigue_rate == value
+    assert engine.warmup_strength == value
+    assert engine.familiarity_boost == value
+
+
+def test_within_document_factor_at_the_clock():
+    engine = TimingEngine(seed=0, warmup_strength=0.10, fatigue_rate=0.03)
+    # At time zero the warmup is fully present and fatigue absent.
+    assert engine._within_document_factor() == pytest.approx(1.10)
+    engine._active_ms = 600_000.0  # ten minutes of active typing
+    assert engine._within_document_factor() == pytest.approx(
+        1.03 * (1.0 + 0.10 * math.exp(-24.0))
+    )
+    # Both disabled: no factor and no clock dependence at all.
+    plain = TimingEngine(
+        seed=0, warmup_strength=0.0, fatigue_rate=0.0
+    )
+    plain._active_ms = 600_000.0
+    assert plain._within_document_factor() == 1.0
+
+
+def test_familiarity_speeds_a_repeated_digraph_base():
+    engine = TimingEngine(seed=0, familiarity_boost=0.25)
+    plain = engine._effective_base("x", "j")
+    first_time = engine._effective_base("x", "j", {"ab"})
+    repeated = engine._effective_base("x", "j", {"xj"})
+    assert first_time == plain
+    assert repeated == pytest.approx(plain * 0.75)
+
+
+@pytest.mark.slow
+def test_fatigue_makes_later_intervals_longer(prose):
+    # Warmup and familiarity off, so the drift is the only index-dependent
+    # effect in the stream. The drift is a document-scale trend and can be
+    # masked by a swing of the latent speed in any one seed, so the direction
+    # is asserted on the cross-seed mean with a majority cross-check.
+    text = prose * LONG_STREAM_REPEATS
+    early_means, late_means = [], []
+    for seed in SEEDS:
+        engine = TimingEngine(seed=seed, warmup_strength=0.0, familiarity_boost=0.0)
+        ikis = [t.iki_ms for t in type_out(engine, text)[1:]]
+        window = len(ikis) // 10
+        early_means.append(statistics.mean(ikis[:window]))
+        late_means.append(statistics.mean(ikis[-window:]))
+
+    assert statistics.mean(late_means) > statistics.mean(early_means)
+    rising = sum(1 for early, late in zip(early_means, late_means) if late > early)
+    assert rising >= len(SEEDS) * 3 // 4
+
+
+@pytest.mark.slow
+def test_warmup_makes_the_first_minute_slower(prose):
+    # Fatigue and familiarity off; the first fifteen seconds are then slower
+    # than the steady state reached a couple of minutes in. A single seed's
+    # early window is short enough for the latent process to drown the
+    # effect, so - as with fatigue - the direction is asserted across seeds.
+    text = prose * 8
+    early_means, steady_means = [], []
+    for seed in SEEDS:
+        engine = TimingEngine(seed=seed, fatigue_rate=0.0, familiarity_boost=0.0)
+        clock = 0.0
+        early, steady = [], []
+        for timing in type_out(engine, text)[1:]:
+            if clock < 15_000.0:
+                early.append(timing.iki_ms)
+            elif 120_000.0 <= clock < 180_000.0:
+                steady.append(timing.iki_ms)
+            clock += timing.iki_ms
+        early_means.append(statistics.mean(early))
+        assert steady, f"seed {seed}: stream never reached the steady window"
+        steady_means.append(statistics.mean(steady))
+
+    assert statistics.mean(early_means) > statistics.mean(steady_means)
+    slower = sum(
+        1 for early, steady in zip(early_means, steady_means) if early > steady
+    )
+    assert slower >= len(SEEDS) // 2
+
+
+@pytest.mark.slow
+def test_a_repeated_word_gets_faster_with_familiarity(prose):
+    # The word's digraphs are unfamiliar on its first occurrence and cached
+    # for every later one. The boost is exaggerated so the direction stands
+    # far above the per-window noise.
+    word = "quetzal"
+    block = len(word) + 1
+    ratios = []
+    for seed in SEEDS:
+        engine = TimingEngine(
+            seed=seed, familiarity_boost=0.3,
+            warmup_strength=0.0, fatigue_rate=0.0,
+        )
+        timings = [engine.next_keystroke(c) for c in (word + " ") * 40]
+        first = [t.iki_ms for t in timings[1:block]]
+        later = [
+            t.iki_ms
+            for i in range(5, 40)
+            for t in timings[i * block + 1:(i + 1) * block]
+        ]
+        ratios.append(statistics.mean(later) / statistics.mean(first))
+    assert statistics.mean(ratios) < 0.85
+
+
+def test_reset_speed_restarts_the_fatigue_and_warmup_clock(prose):
+    engine = TimingEngine(seed=1)
+    for char in prose:
+        engine.next_keystroke(char)
+    assert engine._active_ms > 0.0
+    engine.reset_speed()
+    assert engine._active_ms == 0.0
+
+
+def test_reset_speed_keeps_the_familiarity_cache(prose):
+    # Familiarity belongs to the document, not the sitting: a rest resets the
+    # clock but not the memory of what has been typed.
+    engine = TimingEngine(seed=1)
+    for char in prose:
+        engine.next_keystroke(char)
+    assert engine._familiar_digraphs
+    engine.reset_speed()
+    assert engine._familiar_digraphs
+
+
+def test_disabling_every_dynamic_leaves_first_occurrences_untouched(prose):
+    # With all three effects at zero the within-document factor is exactly 1
+    # and no digraph is cached, so the stream is the stationary model alone.
+    for seed in (0, 1):
+        engine = TimingEngine(
+            seed=seed, fatigue_rate=0.0, warmup_strength=0.0,
+            familiarity_boost=0.0,
+        )
+        type_out(engine, prose)
+        assert engine._familiar_digraphs == set()
+        assert engine._within_document_factor() == 1.0

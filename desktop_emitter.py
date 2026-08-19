@@ -144,12 +144,15 @@ def emit_to_desktop(record: dict, *, speed: float = 1.0,
             if spec.shift:
                 controller.press(keyboard.Key.shift)
             controller.press(key)
-        else:
-            # Shift comes up immediately after the character and is never
-            # left held across the rest of the record.
-            controller.release(key)
             if spec.shift:
+                # Shift wraps the key press alone, not the keystroke's whole
+                # dwell: a rollover key that goes down before this key comes
+                # up must not see Shift held. Releasing it right after the
+                # press keeps the produced character (decided at press time)
+                # and restores the caller's own Shift state.
                 controller.release(keyboard.Key.shift)
+        else:
+            controller.release(key)
 
     listener = keyboard.Listener(on_press=_on_press)
     try:
