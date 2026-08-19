@@ -21,7 +21,7 @@ from macro_scripter import (
     tokenize,
 )
 
-from conftest import CORPUS, EDGE_CASES
+from conftest import CORPUS, EDGE_CASES, PROSE
 
 # Seeds used wherever a test needs several independent runs. Fixed, so a
 # failure is always reproducible.
@@ -299,6 +299,59 @@ def test_context_after_classifies_the_terminator(token, expected):
     assert MacroScripter._context_after(token) == expected
 
 
+# --- thinking-pause budget and the 15-minute ceiling ---------------------------
+
+# The README replay sample: 177 chars, two sentences.
+README_SAMPLE_TEXT = (
+    "Academic integrity depends on evidence that a piece of writing was "
+    "actually composed by the person who submitted it. The process leaves "
+    "traces that a finished document does not."
+)
+
+
+def _thinking_pauses(script):
+    """PAUSE ops that are not typo reactions or revision beats."""
+    return [e for e in script if e.op == ms.OP_PAUSE and e.role == ms.ROLE_TEXT]
+
+
+def test_short_text_thinking_pauses_stay_within_budget():
+    # The owner-facing rule of thumb: pauses are sentence/burst-level events,
+    # not per-word events. On the 177-char README sample at seed 23 the
+    # measured count is 3 thinking pauses (729/649/1011 ms, none over 2 s);
+    # the bound below is a budget, not the exact count, so the stream can move
+    # with future model work without tripping it.
+    script = MacroScripter(seed=23).generate_script(README_SAMPLE_TEXT)
+    thinking = _thinking_pauses(script)
+    assert 0 <= len(thinking) <= 8
+    assert sum(1 for e in thinking if e.duration_ms > 2_000.0) <= 2
+    assert all(e.duration_ms <= ms.MAX_SILENCE_MS for e in thinking)
+
+
+def test_long_text_thinking_pauses_track_sentences_not_words():
+    # 2000 chars of prose, seed 23: measured 43 thinking pauses, roughly one
+    # per one to three sentences. Before the boundary rework the same text
+    # drew several hundred (a pause after nearly every word).
+    text = (PROSE * 7)[:2000].strip()
+    script = MacroScripter(seed=23).generate_script(text)
+    assert 15 <= len(_thinking_pauses(script)) <= 60
+
+
+def test_no_recorded_silence_exceeds_fifteen_minutes(corpus):
+    # Sweep seeds over the thinned corpus, forcing sessions short enough that
+    # the session-gap table - which draws 0.5-48 hours - is exercised. Every
+    # pause and every gap must come in at or under the ceiling.
+    for seed in SEEDS:
+        scripter = MacroScripter(seed=seed, session_chars=60)
+        gaps = 0
+        for text in corpus[::13]:
+            script = scripter.generate_script(text)
+            for event in script:
+                if event.op in (ms.OP_PAUSE, ms.OP_SESSION_GAP):
+                    assert 0.0 < event.duration_ms <= ms.MAX_SILENCE_MS
+            gaps += sum(1 for e in script if e.op == ms.OP_SESSION_GAP)
+        assert gaps, f"seed {seed} saw no session gaps despite session_chars=60"
+
+
 # --- bursts, typos and revisions ---------------------------------------------
 
 
@@ -536,11 +589,12 @@ def test_a_session_gap_is_never_the_last_event(long_prose):
 
 def test_session_gap_durations_are_plausible(long_prose):
     script = MacroScripter(seed=6, session_chars=60).generate_script(long_prose)
-    gaps = [e.duration_ms / 3_600_000.0 for e in script if e.op == ms.OP_SESSION_GAP]
+    gaps = [e.duration_ms for e in script if e.op == ms.OP_SESSION_GAP]
     assert gaps
-    lowest = min(ms.SESSION_GAP_HOURS) * 0.85
-    highest = max(ms.SESSION_GAP_HOURS) * 1.15
-    assert all(lowest <= hours <= highest for hours in gaps)
+    # SESSION_GAP_HOURS draws 0.5-48 h even at the lowest jitter, and the
+    # fifteen-minute ceiling clamps every one of those draws, so with the
+    # current table each gap lands exactly on the cap.
+    assert all(gap == ms.MAX_SILENCE_MS for gap in gaps)
 
 
 def test_session_gap_weights_match_the_hours():
@@ -612,16 +666,68 @@ def test_pause_durations_are_positive_and_finite(long_prose):
             assert math.isfinite(event.duration_ms)
 
 
-def test_a_pause_precedes_every_whitespace_keystroke():
-    # Whitespace is where the scripter places its pause hierarchy; if a space
-    # were typed without one the pause distribution would never be exercised.
+def test_word_boundaries_emit_no_pause():
+    # Hesitation between words lives in the inter-key variance of the timing
+    # engine; a PAUSE op after plain words put a pause every couple of seconds
+    # of output. A burst-end pause can still precede a *word* token, but never
+    # a space.
     script = MacroScripter(
-        seed=1, typo_rate=0.0, r_burst_probability=0.0
-    ).generate_script("one two three")
+        seed=1, typo_rate=0.0, r_burst_probability=0.0,
+        structural_revision_rate=0.0,
+    ).generate_script("one two three four five six seven eight nine ten")
     spaces = [i for i, e in enumerate(script) if e.op == ms.OP_TYPE and e.char == " "]
     assert spaces
     for index in spaces:
-        assert script[index - 1].op == ms.OP_PAUSE
+        assert script[index - 1].op != ms.OP_PAUSE
+
+
+def test_paragraph_boundaries_always_pause():
+    # The second newline of a blank line carries the paragraph context, whose
+    # boundary probability is 1.0.
+    script = MacroScripter(
+        seed=1, typo_rate=0.0, r_burst_probability=0.0,
+        structural_revision_rate=0.0,
+    ).generate_script("One two.\n\nThree four.")
+    newlines = [
+        i for i, e in enumerate(script) if e.op == ms.OP_TYPE and e.char == "\n"
+    ]
+    assert len(newlines) == 2
+    assert script[newlines[0] - 1].op != ms.OP_PAUSE  # sentence roll: seed 1 misses
+    assert script[newlines[1] - 1].op == ms.OP_PAUSE  # paragraph: certain
+
+
+def test_boundary_pauses_fire_at_their_model_rates():
+    # Sentence and clause boundaries pause on a roll of 0.4 and 0.2
+    # (BOUNDARY_PAUSE_PROBABILITIES), so over a fixed text at a fixed seed the
+    # count of boundary pauses has to sit strictly between none and all.
+    text = ("One two three four. Five, six seven eight. " * 6).strip()
+    paused_sentence = 0
+    paused_clause = 0
+    sentences = text.count(". ") + text.count(".\n")
+    clauses = text.count(", ")
+    script = MacroScripter(
+        seed=6, typo_rate=0.0, r_burst_probability=0.0,
+        structural_revision_rate=0.0,
+    ).generate_script(text)
+    events = script
+    for index, event in enumerate(events):
+        if event.op != ms.OP_PAUSE or event.role != ms.ROLE_TEXT:
+            continue
+        following = events[index + 1] if index + 1 < len(events) else None
+        if following is not None and following.op == ms.OP_TYPE and following.char == " ":
+            previous = next(
+                e for e in reversed(events[:index])
+                if e.op == ms.OP_TYPE and not e.char.isspace()
+            )
+            if previous.char == ".":
+                paused_sentence += 1
+            elif previous.char == ",":
+                paused_clause += 1
+    # The 0.4 / 0.2 rolls: allow a wide band around the draw of this one seed;
+    # measured values at seed 6 are 5 of 11 sentence boundaries and 1 of 6
+    # clause boundaries.
+    assert 0 < paused_sentence < sentences
+    assert 0 <= paused_clause <= clauses
 
 
 def test_reported_corpus_index_is_stable():

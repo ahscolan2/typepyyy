@@ -63,6 +63,29 @@ PAUSE_CLAUSE = (5.2, 0.5)
 PAUSE_SENTENCE = (6.2, 0.6)
 PAUSE_PARAGRAPH = (7.0, 0.7)
 
+# How often a syntactic boundary inside a burst actually becomes a PAUSE op.
+# Plain word boundaries are absent from the table and never pause: hesitation
+# between words already lives in the inter-key variance of the timing engine,
+# and pausing after nearly every word produced one pause every couple of
+# seconds of output. Sentence boundaries pause sometimes, clause boundaries
+# less often, and a paragraph break always pauses. Burst-end pauses are a
+# separate mechanism (the P-burst/R-burst structure of Chenoweth & Hayes) and
+# are unaffected. The probabilities are model choices, not literature figures:
+# the sources fix the burst structure and the pause magnitudes, but say
+# nothing about how often a boundary turns into a measurable pause.
+BOUNDARY_PAUSE_PROBABILITIES = {
+    "clause": 0.2,
+    "sentence": 0.4,
+    "paragraph": 1.0,
+}
+
+# Hard ceiling on any single recorded silence - thinking pause or session
+# gap - in milliseconds. The product rule is that no fifteen-minute-plus
+# pause appears in a record: the session-gap table below draws 0.5-48 hours
+# and is clamped here, so every gap currently lands on the cap exactly. The
+# lognormal pause sampler reaches the ceiling only in its far tail.
+MAX_SILENCE_MS = 900_000.0
+
 # Reaction time before noticing and fixing a typo, ms.
 TYPO_REACTION_RANGE = (300.0, 800.0)
 
@@ -252,7 +275,7 @@ class MacroScripter:
             mu, sigma = PAUSE_CLAUSE
         else:
             mu, sigma = PAUSE_WORD
-        return self._rng.lognormvariate(mu, sigma)
+        return min(self._rng.lognormvariate(mu, sigma), MAX_SILENCE_MS)
 
     def _next_session_length(self) -> int:
         minutes = self._rng.uniform(*SESSION_MINUTES_RANGE)
@@ -368,9 +391,16 @@ class MacroScripter:
                 context = pending_context or (
                     "paragraph" if _is_newline(token) else "word"
                 )
-                events.append(
-                    ScriptEvent(OP_PAUSE, duration_ms=self._pause_ms(context))
-                )
+                # A boundary becomes a thinking pause only sometimes; plain
+                # word boundaries (probability 0) never do.
+                if self._rng.random() < BOUNDARY_PAUSE_PROBABILITIES.get(
+                    context, 0.0
+                ):
+                    events.append(
+                        ScriptEvent(
+                            OP_PAUSE, duration_ms=self._pause_ms(context)
+                        )
+                    )
                 events.append(ScriptEvent(OP_TYPE, char=token))
                 committed += 1
                 chars_this_session += 1
@@ -457,7 +487,10 @@ class MacroScripter:
         hours = self._rng.choices(SESSION_GAP_HOURS, weights=SESSION_GAP_WEIGHTS)[0]
         # Jitter so gaps are not all exactly round numbers of hours.
         hours *= self._rng.uniform(0.85, 1.15)
-        return hours * 3_600_000.0
+        # MAX_SILENCE_MS caps the gap at fifteen minutes. The hours table
+        # draws 0.5-48 h, so every gap currently lands on the cap; the table
+        # and jitter stay so that raising the ceiling reactivates the spread.
+        return min(hours * 3_600_000.0, MAX_SILENCE_MS)
 
     def _revise(
         self,

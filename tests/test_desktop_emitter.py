@@ -144,8 +144,10 @@ def test_shift_wraps_the_press_only_and_does_not_bleed_into_rollover(fake_pynput
     "text,seed",
     [
         ("The Quick Brown Fox jumps over the lazy dog.", 2),
-        ("He laughed. She cried. Then They left.", 4),
-        ("A Big Cat sat There. Wow!", 3),
+        # Seeds re-picked after the boundary-pause rework shifted the generated
+        # streams: 4 and 3 no longer produced a shifted-key overlap.
+        ("He laughed. She cried. Then They left.", 0),
+        ("A Big Cat sat There. Wow!", 4),
     ],
 )
 def test_real_records_reproduce_their_target_text(fake_pynput, text, seed):

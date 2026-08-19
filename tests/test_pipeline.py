@@ -209,8 +209,12 @@ def test_motor_interval_is_zero_at_the_start_and_after_every_session_gap(
     assert zeros[0]["index"] == 0
 
     # Every other zero is a keystroke that resumed after a gap, so its full
-    # interval spans at least the shortest gap the scripter can draw.
-    shortest_gap_ms = min(ms.SESSION_GAP_HOURS) * 0.85 * 3_600_000.0
+    # interval spans at least the shortest gap the scripter can draw - the
+    # hours table's floor, clamped by the fifteen-minute ceiling (currently
+    # the clamp always wins).
+    shortest_gap_ms = min(
+        min(ms.SESSION_GAP_HOURS) * 0.85 * 3_600_000.0, ms.MAX_SILENCE_MS
+    )
     for event in zeros[1:]:
         assert event["iki_ms"] >= shortest_gap_ms
 
@@ -254,8 +258,8 @@ def test_pause_intervals_are_counted(record):
 
 
 def test_active_wpm_on_prose_with_pauses_is_below_the_keystroke_rate(long_prose):
-    # Composition pauses count against wpm_active, which is why it sits near 37
-    # rather than the engine's 52 WPM keystroke rate.
+    # Composition pauses count against wpm_active, which is why it sits in the
+    # low 30s rather than at the engine's 52 WPM keystroke rate.
     rates = [generate(long_prose, seed=s)["statistics"]["wpm_active"] for s in range(8)]
     assert 28.0 <= sum(rates) / len(rates) <= 46.0
 

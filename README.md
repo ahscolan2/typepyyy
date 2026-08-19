@@ -92,7 +92,7 @@ the target window, and pressing **Esc** aborts the emission.
 
 Timing is faithful to the record by default. `--emit-speed 2.0` compresses time by
 that factor; `--emit-max-gap-s 5` shortens any silence longer than five seconds —
-a multi-hour session gap, say — to exactly five seconds.
+a fifteen-minute session gap, say — to exactly five seconds.
 
 ## CLI
 
@@ -197,27 +197,30 @@ TypeTrace writing replay
 
   characters : 177  (29 words)
   profile    : average, seed 23
-  elapsed    : 1.2 min writing
-  speed      : 29.1 WPM
-  keystrokes : 239 (31 backspaces, 3 typo events, 0 session gaps)
+  elapsed    : 57.7 s writing
+  speed      : 36.8 WPM
+  keystrokes : 193 (8 backspaces, 8 typo events, 0 session gaps)
 
           TIME  DOCUMENT                                                   EVENT
   ------------  ---------------------------------------------------------- ------------------------------
      00:00.000  A|                                                         start writing
-     00:00.332  …c integrity depends on evidence that a piece of writing | type 62 characters
-     00:16.989  … integrity depends on evidence that a piece of writing w| pause 1.1 s
-     00:17.185  … evidence that a piece of writing was actually composed | type 21 characters
-     00:23.670  …integrity depends on evidence that a piece of writing wa| delete back 20 characters
-     00:31.734  … evidence that a piece of writing was actually composed | rewrite 20 characters
-     00:39.069  …evidence that a piece of writing was actually composed b| pause 745 ms
-     00:39.390  … a piece of writing was actually composed by the person | type 13 characters
+     00:00.316  Academic |                                                 type 8 characters
+     00:02.227  Academic u|                                                mistype 'u'
+     00:03.333  Academic |                                                 notice it, backspace
+     00:03.611  Academic i|                                                retype 'i'
+     00:03.906  Academic in|                                               type 1 characters
 
-     [11 rows elided]
+     [25 rows elided]
 
-     01:09.926  … The process leaves traces that a finished document doez| mistype 'z'
-     01:10.769  …. The process leaves traces that a finished document doe| notice it, backspace
-     01:11.034  … The process leaves traces that a finished document does| retype 's'
-     01:11.456  …process leaves traces that a finished document does not.| type 5 characters
+     00:40.892  …ctually composed by the person who submitted it. The pro| notice it, backspace
+     00:41.293  …tually composed by the person who submitted it. The proc| retype 'c'
+     00:41.629  …ly composed by the person who submitted it. The process | type 4 characters
+     00:43.939  …y composed by the person who submitted it. The process l| pause 1.0 s
+     00:44.089  …the person who submitted it. The process leaves traces t| type 14 characters
+     00:48.162  …he person who submitted it. The process leaves traces tg| mistype 'g'
+     00:48.752  …the person who submitted it. The process leaves traces t| notice it, backspace
+     00:49.043  …the person who submitted it. The process leaves traces th| retype 'h'
+     00:49.161  …process leaves traces that a finished document does not.| type 32 characters
 
 Final text
 ----------
@@ -228,7 +231,9 @@ The `DOCUMENT` column is the tail of the document as it stood after that event, 
 `|` for the cursor and `…` where the line was cut. Runs of ordinary typing are folded
 into one line reporting how many characters they covered; a pause, a typo, a revision
 or the end of a session keeps a line of its own. A session gap prints as its own
-`STOP` line, and the timestamp then widens to `1d 04:12:37` rather than rolling over.
+`STOP` line, and the timestamp then widens past the minute field — to
+`1:04:12.037` with hours, or `1d 04:12:37` on a multi-day wall clock — rather
+than rolling over.
 
 `--format replay-full` prints one line per keystroke with nothing folded. It is
 thousands of lines for an essay, which is why it is not the default.
@@ -258,6 +263,8 @@ their bands.
 | Warmup | +10% at the start, decaying with τ = 25 s | model choice |
 | Familiarity | repeated digraphs 8% faster, per document | model choice |
 | Pause medians | 90 / 181 / 493 / 1097 ms | word / clause / sentence / paragraph |
+| Boundary pause probability | 0 / 0.2 / 0.4 / 1.0 | model choice: word / clause / sentence / paragraph boundaries inside a burst |
+| Longest recorded silence | 15 min hard cap on any pause or session gap | model choice |
 | Session length | 20–90 min | at 160 chars/min composition |
 
 ### Achieved
@@ -269,11 +276,11 @@ text-dependent, so treat them as bands rather than constants.
 |---|---|---|
 | `average` profile, keystroke clock | 51.7 WPM [48.8, 55.1] | 52 WPM (Dhakal) |
 | `slow` / `fast` profile | 34.4 / 74.3 WPM | relative |
-| `wpm_active`, whole pipeline | 30.3 [22.8, 37.4] | lower than above; composition pauses and revisions count |
-| Mean dwell | 119.0 ms [117.2, 120.9] | 116 plus genuine rollover extension |
-| Mean motor interval | 248.2 ms [235.6, 259.5] | — |
-| Lag-1 autocorrelation | 0.357 [0.314, 0.397] | 0.35 |
-| Deletion ratio | 0.165 [0.071, 0.288] | 0.10–0.30 reported for real composition |
+| `wpm_active`, whole pipeline | 32.6 [24.9, 41.3] | lower than above; composition pauses and revisions count |
+| Mean dwell | 118.2 ms [116.9, 120.1] | 116 plus genuine rollover extension |
+| Mean motor interval | 246.9 ms [230.8, 258.8] | — |
+| Lag-1 autocorrelation | 0.348 [0.297, 0.391] | 0.35 |
+| Deletion ratio | 0.153 [0.062, 0.262] | 0.10–0.30 reported for real composition |
 | Rollover | ~11% of keystrokes | — |
 
 Burstiness is modelled as an AR(1) latent speed in log space. `--target-autocorrelation`
@@ -302,6 +309,15 @@ paragraph break to the previous paragraph's trailing sentence — and retypes th
 identical characters, so the replay invariant holds by construction. Structural
 revisions are what lift the deletion ratio into the reported 0.10–0.30 band; the
 burst-local mechanism alone cannot reach it.
+
+Thinking pauses are sentence- and burst-level events, not word-level ones. Bursts
+of fluent typing (Chenoweth & Hayes P-bursts) end their own pause, and inside a
+burst a syntactic boundary pauses only by roll: never at a plain word boundary
+(hesitation there already lives in the inter-key variance), sometimes at a clause
+boundary, more often at a sentence boundary, always at a paragraph break. The
+probabilities are model choices and sit in Inputs next to the pause medians. No
+single silence — pause or session gap — is allowed past fifteen minutes: longer
+draws are clamped to the cap.
 
 ## Testing
 
