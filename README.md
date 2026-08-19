@@ -1,13 +1,23 @@
-# Project Aletheia
+# Project TypeTrace
 
-Aletheia generates synthetic writing-process data: keystroke-level records of how a
+TypeTrace generates synthetic writing-process data: keystroke-level records of how a
 piece of text could plausibly have been typed, including inter-key intervals, key
 hold times, thinking pauses, typos that get corrected, revisions, and gaps between
 writing sessions. The records are intended as training and evaluation data for
-detectors of machine-generated writing.
+academic-integrity research — for example, as inputs to detectors of
+machine-generated writing. TypeTrace can also replay a record into a real document
+editor, so we can study what those editors actually record of the writing process.
 
-It writes data files. It does not automate a browser, drive a document editor, or
-make any network request.
+On its own it writes data files; with the optional extras installed it can also
+type a record into a live editor — see **Replaying into a live editor** below.
+
+## Intended use & ethics
+
+TypeTrace is research and evaluation tooling for studying editor telemetry — what a
+document editor's logs, such as the Google Docs version history, look like for a
+known writing process. Run it only against documents and accounts you own or have
+explicit consent to use. Never use it to misrepresent authorship in graded,
+published, or contractual work.
 
 ## Install
 
@@ -16,6 +26,13 @@ pip install -r requirements.txt
 ```
 
 numpy is the only runtime dependency. Python 3.10 or newer.
+
+Replaying into an editor is optional and pulls in extra dependencies, installed
+separately:
+
+- **Google Docs replay:** `pip install playwright` followed by
+  `playwright install chromium`
+- **Desktop replay:** `pip install pynput`
 
 ## Quickstart
 
@@ -47,6 +64,42 @@ and the same output formats. It calls the same generator, so a given seed produc
 same record either way. tkinter ships with CPython, so there is nothing further to
 install.
 
+## Replaying into a live editor
+
+With `--emit`, a generated record is typed back into a real document editor after it
+has been generated and written, replaying the record's own keystroke clock — keydowns
+and keyups in time order, with the modelled inter-key intervals, dwells, pauses and
+session gaps.
+
+### Google Docs
+
+```bash
+python main.py --text @essay.txt --seed 42 --output record.json --emit docs --doc-id <document-id>
+```
+
+Requires the playwright extra (see Install). The first run opens a visible browser
+window so you can log into your own Google account; the browser profile persists in
+`.typetrace-browser-profile/`, so later runs reuse that login (`--headless` only makes
+sense once the profile exists — logging in needs the visible window). Use a blank
+test document: the document ID is the long string in its URL. Afterwards, inspect
+**Tools → Version history** in Google Docs to see what the editor recorded.
+
+### Desktop (Word and other editors)
+
+```bash
+python main.py --text "Hello world. This is a test." --seed 42 --emit desktop -o record.json
+```
+
+Requires the pynput extra. Emission types into whatever window has focus — Word,
+Notepad, a text field. It counts down five seconds before starting so you can focus
+the target window, and pressing **Esc** aborts the emission.
+
+### Timing control
+
+Timing is faithful to the record by default. `--emit-speed 2.0` compresses time by
+that factor; `--emit-max-gap-s 5` shortens any silence longer than five seconds —
+a multi-hour session gap, say — to exactly five seconds.
+
 ## CLI
 
 | Option | Description | Default |
@@ -62,6 +115,12 @@ install.
 | `--session-chars` | Force a session to end after this many characters | none |
 | `--target-autocorrelation` | Target lag-1 autocorrelation of motor intervals | `0.35` |
 | `--verbose`, `-v` | Print a summary to stderr | off |
+| `--emit` | Replay the record into a live editor after writing it: `docs` or `desktop` | off |
+| `--doc-id` | Google Docs document ID (with `--emit docs`) | none |
+| `--emit-speed` | Time compression for emission; `2.0` is twice as fast | `1.0` |
+| `--emit-max-gap-s` | Shorten silences longer than this to exactly this many seconds | none |
+| `--headless` | Run the browser without a visible window | off |
+| `--browser-profile` | Browser profile directory holding the Google login | `.typetrace-browser-profile` |
 
 To pass literal text beginning with `@`, escape it as `\@`.
 
@@ -69,7 +128,7 @@ To pass literal text beginning with `@`, escape it as `\@`.
 
 ```json
 {
-  "generated_by": "Aletheia-Research",
+  "generated_by": "TypeTrace-Research",
   "purpose": "detection_training",
   "synthetic_research_data": true,
   "schema_version": 2,
@@ -135,8 +194,8 @@ python main.py --text "Academic integrity depends on evidence ..." \
 ```
 
 ```
-Aletheia writing replay
-=======================
+TypeTrace writing replay
+========================
 
   characters : 177  (29 words)
   profile    : average, seed 23
@@ -251,19 +310,11 @@ python -m pytest -q
   statistics it was built from. Whether a detector trained on this data transfers to
   real human writing is an open question and is not evidenced here.
 
-## legacy_browser_path/
+## History
 
-The original project also contained a Chrome DevTools module that typed into a live
-Google Docs document. It is not part of this package: nothing imports it, the CLI has
-no path into it, and it is excluded from the test and lint runs. It is kept in
-`legacy_browser_path/`, unmodified, with a README explaining what it does and why it
-sits apart. Read that before using it.
-
-That README also carries the full **"What was not done"** record for this rewrite —
-every gap left behind, what each one means in practice, and what it costs. The
-Limitations section above is the part that affects how you read the output; the
-record there is the complete list, including decisions that were made on the
-maintainer's judgement rather than the owner's.
+Earlier versions of TypeTrace could type a generated record into a live Google Docs
+document over the Chrome DevTools Protocol. That code was repaired and integrated as
+the optional `--emit` feature documented above.
 
 ## License
 

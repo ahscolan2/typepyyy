@@ -1,5 +1,5 @@
 """
-Project Aletheia - Writing replay
+Project TypeTrace - Writing replay
 
 Renders a generated record as a readable account of the writing process:
 what the document looked like as it was being written, where the writer
@@ -282,8 +282,8 @@ def render(
     target = record["target_text"]
 
     lines = [
-        "Aletheia writing replay",
-        "=" * 23,
+        "TypeTrace writing replay",
+        "=" * 24,
         "",
         f"  characters : {meta['input_chars']}  ({meta['input_words']} words)",
         f"  profile    : {meta['profile']}"

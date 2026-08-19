@@ -1,5 +1,5 @@
 """
-Project Aletheia - Macro Scripter
+Project TypeTrace - Macro Scripter
 
 Generates the high-level writing process: bursts of fluent typing separated by
 pauses, typos that get corrected, revisions that delete and retype, and gaps

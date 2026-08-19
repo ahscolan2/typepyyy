@@ -3,7 +3,7 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "aletheia"
+name = "typetrace"
 # Tracks the record "schema_version" emitted in main.WATERMARK, so a dataset can
 # be traced back to the generator release that produced it.
 version = "2.0.0"
@@ -11,7 +11,7 @@ description = "Offline generator of synthetic writing-process datasets for detec
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
-authors = [{ name = "Project Aletheia" }]
+authors = [{ name = "Project TypeTrace" }]
 keywords = [
     "keystroke-dynamics",
     "synthetic-data",
@@ -40,19 +40,30 @@ dev = [
     "pytest>=7.4",
     "ruff>=0.6",
 ]
+# Optional emitters, used only by "python main.py --emit ...". The generator
+# itself imports neither.
+docs = [
+    "playwright>=1.40",
+]
+desktop = [
+    "pynput>=1.7",
+]
 
 [project.urls]
-Homepage = "https://github.com/ahscolan2/aletheia"
+Homepage = "https://github.com/ahscolan2/typetrace"
 
 [project.scripts]
 # main.main returns an exit code, which is exactly what console_scripts expects.
-aletheia = "main:main"
+typetrace = "main:main"
 
 [tool.setuptools]
 # The package is a set of flat modules at the repository root rather than a
 # package directory, so that "python main.py" from a checkout keeps working
 # unchanged. py-modules preserves that layout when installed.
 py-modules = [
+    "desktop_emitter",
+    "docs_emitter",
+    "emit_common",
     "error_models",
     "gui",
     "macro_scripter",
@@ -84,16 +95,10 @@ norecursedirs = [
     "dist",
     "datasets",
     "__pycache__",
-    # Archived, not part of the package. See its README.
-    "legacy_browser_path",
 ]
 
 [tool.ruff]
 target-version = "py310"
-# Archived code that is not part of the package and is not maintained here. It
-# is excluded so that editing it can never turn the lint gate red for changes
-# that have nothing to do with it. See legacy_browser_path/README.md.
-exclude = ["legacy_browser_path"]
 
 [tool.ruff.lint]
 # Restricted to the rules that flag genuine defects - syntax errors, undefined

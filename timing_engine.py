@@ -1,5 +1,5 @@
 """
-Project Aletheia - Timing Engine
+Project TypeTrace - Timing Engine
 
 Generates micro-level keystroke timing (inter-key intervals and dwell times)
 for a stream of key actions.

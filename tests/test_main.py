@@ -2,13 +2,15 @@
 
 Two things matter here beyond the happy path. The first is that failures come
 back as an exit code rather than a traceback, because the tool is meant to be
-scriptable. The second is that the CLI has no browser-driving options: --mode
-and --doc-id belonged to a Chrome DevTools path that is no longer wired to
-anything, and a test that asserts they are rejected is what stops them
-creeping back.
+scriptable. The second is that the emitters (replaying a record into Google
+Docs or the desktop) stay an optional feature: the generator must run with
+neither playwright nor pynput importable, and the --emit flags must be wired
+through to the emitter modules only when they are requested.
 """
 
 import json
+import sys
+import types
 
 import pytest
 
@@ -82,27 +84,16 @@ def test_an_unknown_profile_is_rejected():
         build_parser().parse_args(["-t", "x", "-p", "turbo"])
 
 
-@pytest.mark.parametrize(
-    "argv",
-    [
-        ["--text", "x", "--mode", "dry-run"],
-        ["--text", "x", "--mode", "live"],
-        ["--text", "x", "--doc-id", "abc123"],
-        ["--text", "x", "--mode", "live", "--doc-id", "abc123"],
-    ],
-)
-def test_the_browser_driving_options_are_gone(argv):
-    # cdp_emitter.py is still in the repository but is not wired to anything:
-    # nothing imports it, and the CLI has no path into it. This generator
-    # writes data files and drives nothing.
+def test_an_unknown_emit_target_is_rejected():
     with pytest.raises(SystemExit):
-        build_parser().parse_args(argv)
+        build_parser().parse_args(["-t", "x", "--emit", "notepad"])
 
 
-def test_no_option_mentions_a_browser_or_a_document_id():
-    help_text = build_parser().format_help().lower()
-    for word in ("--mode", "--doc-id", "playwright", "chrome", "devtools"):
-        assert word not in help_text
+def test_help_lists_the_emit_options():
+    help_text = build_parser().format_help()
+    for flag in ("--emit", "--doc-id", "--emit-speed", "--emit-max-gap-s",
+                 "--headless", "--browser-profile"):
+        assert flag in help_text
 
 
 def test_defaults_match_the_library_defaults():
@@ -117,6 +108,109 @@ def test_defaults_match_the_library_defaults():
     assert args.target_autocorrelation is None
     assert args.force is False
     assert args.verbose is False
+    assert args.emit is None
+    assert args.doc_id is None
+    assert args.emit_speed == 1.0
+    assert args.emit_max_gap_s is None
+    assert args.headless is False
+    assert args.browser_profile == ".typetrace-browser-profile"
+
+
+# --- optional emitters -------------------------------------------------------
+#
+# Replaying a record into a live editor (Google Docs or the desktop) is an
+# intentional optional feature, backed by playwright and pynput respectively.
+# The generator itself needs only numpy, so these tests block those imports -
+# sys.modules[name] = None makes "import name" fail - and fake emitter modules
+# check that the CLI wires the --emit flags through correctly when asked.
+
+
+def _block_emitter_dependencies(monkeypatch):
+    """Simulate an environment where the optional deps were never installed."""
+    for name in ("playwright", "pynput"):
+        monkeypatch.setitem(sys.modules, name, None)
+
+
+def test_the_core_modules_import():
+    import importlib
+
+    for name in ("main", "pipeline", "macro_scripter", "timing_engine",
+                 "error_models", "replay", "gui"):
+        importlib.import_module(name)
+
+
+def test_generation_works_without_the_emitter_dependencies(monkeypatch, capsys):
+    _block_emitter_dependencies(monkeypatch)
+    assert main.main(["--text", "Hello there.", "--seed", "1"]) == 0
+    assert json.loads(capsys.readouterr().out)["target_text"] == "Hello there."
+
+
+def test_help_works_without_the_emitter_dependencies(monkeypatch, capsys):
+    _block_emitter_dependencies(monkeypatch)
+    with pytest.raises(SystemExit) as excinfo:
+        build_parser().parse_args(["--help"])
+    assert excinfo.value.code == 0
+    assert "--emit" in capsys.readouterr().out
+
+
+def test_emitters_are_not_imported_on_a_plain_run(monkeypatch):
+    for name in ("emit_common", "docs_emitter", "desktop_emitter"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    assert main.main(["--text", "Hello.", "--seed", "1"]) == 0
+    for name in ("emit_common", "docs_emitter", "desktop_emitter"):
+        assert name not in sys.modules
+
+
+def test_emit_docs_requires_a_doc_id(capsys):
+    assert main.main(["--text", "Hello.", "--emit", "docs"]) == 1
+    assert "--doc-id" in capsys.readouterr().err
+
+
+def test_emit_docs_passes_the_cli_arguments_through(monkeypatch):
+    seen = {}
+
+    def emit_to_google_docs(record, **kwargs):
+        seen["target_text"] = record["target_text"]
+        seen.update(kwargs)
+        return {"dispatched": 0, "aborted": False, "duration_s": 0.0}
+
+    monkeypatch.setitem(
+        sys.modules, "docs_emitter",
+        types.SimpleNamespace(emit_to_google_docs=emit_to_google_docs),
+    )
+    assert main.main([
+        "--text", "Hi.", "--seed", "1", "--emit", "docs",
+        "--doc-id", "abc123", "--emit-speed", "2.0",
+        "--emit-max-gap-s", "0.5", "--headless",
+        "--browser-profile", "some-profile",
+    ]) == 0
+    assert seen == {
+        "target_text": "Hi.",
+        "doc_id": "abc123",
+        "speed": 2.0,
+        "max_gap_s": 0.5,
+        "headless": True,
+        "profile_dir": "some-profile",
+    }
+
+
+def test_emit_desktop_passes_the_cli_arguments_through(monkeypatch):
+    seen = {}
+
+    def emit_to_desktop(record, **kwargs):
+        seen["target_text"] = record["target_text"]
+        seen.update(kwargs)
+        return {"dispatched": 0, "aborted": False, "duration_s": 0.0}
+
+    monkeypatch.setitem(
+        sys.modules, "desktop_emitter",
+        types.SimpleNamespace(emit_to_desktop=emit_to_desktop),
+    )
+    assert main.main([
+        "--text", "Hi.", "--seed", "1", "--emit", "desktop",
+        "--emit-speed", "2.0", "--emit-max-gap-s", "0.5",
+    ]) == 0
+    assert seen == {"target_text": "Hi.", "speed": 2.0, "max_gap_s": 0.5}
 
 
 # --- generate_full_output ----------------------------------------------------

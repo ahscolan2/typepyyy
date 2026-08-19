@@ -1,5 +1,5 @@
 """
-Project Aletheia - Desktop application
+Project TypeTrace - Desktop application
 
 A window over the same generator the CLI drives. Every parameter the CLI
 accepts is here, and the result can be viewed as the readable writing replay
@@ -23,7 +23,7 @@ import macro_scripter as ms
 import replay
 from main import generate_full_output
 
-WINDOW_TITLE = "Aletheia - synthetic writing process generator"
+WINDOW_TITLE = "TypeTrace - synthetic writing process generator"
 DEFAULT_TEXT = (
     "Academic integrity is essential to higher education. Students must "
     "produce original work, and institutions need reliable ways to evaluate "

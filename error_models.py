@@ -1,5 +1,5 @@
 """
-Project Aletheia - Cognitive error models (optional, standalone).
+Project TypeTrace - Cognitive error models (optional, standalone).
 
 A library of typing errors richer than the single neighbour-key substitution
 that macro_scripter implements: anticipations, perseverations, transpositions,

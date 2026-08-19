@@ -1,5 +1,5 @@
 """
-Project Aletheia - Pipeline
+Project TypeTrace - Pipeline
 
 Joins the macro script (what happens) to the timing engine (when it happens)
 on a single monotonic clock, and derives the output record.
