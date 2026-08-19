@@ -165,6 +165,15 @@ def payloads_for(keystroke: Dict[str, Any], event: str) -> List[Dict[str, Any]]:
 
     No timestamp field is set on any payload; run_timeline decides when each
     payload is sent.
+
+    desktop_emitter releases Shift immediately after the press rather than
+    holding it across the dwell, and the two are meant to differ. pynput
+    drives the real OS keyboard, where a held Shift is global state that the
+    next rolled-over key would genuinely see. CDP carries `modifiers` on each
+    individual payload and the character comes from the char event's explicit
+    `text`, so a rolled-over key dispatched between the Shift rawKeyDown and
+    its keyUp still declares modifiers=0 and still inserts its own text. The
+    hold is per-event bookkeeping here, not a machine-wide modifier latch.
     """
     if event not in ("down", "up"):
         raise ValueError(f"event must be 'down' or 'up', got {event!r}")

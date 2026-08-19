@@ -1,0 +1,4 @@
+# Normalise line endings in the repository to LF regardless of the platform a
+# contributor checks out on. Without this a Windows checkout stores CRLF and
+# every touched file shows up as a whole-file rewrite in the diff.
+* text=auto eol=lf

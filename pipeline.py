@@ -147,14 +147,25 @@ def build_timeline(
     # Time of the most recent keydown. The first keystroke is placed relative
     # to zero rather than to a previous key.
     last_keydown: Optional[float] = None
+    # Total silence owed to the clock before the next keystroke lands, and the
+    # part of it that is thinking pause rather than session gap. A gap already
+    # has its own interval, so folding it into the pause total as well would
+    # record the same silence twice - once as a gap and once as a phantom
+    # fifteen-minute pause at the same start_ms.
     pending_delay_ms = 0.0
+    pending_pause_ms = 0.0
+    pause_start_ms: Optional[float] = None
     # Set when a session gap has just been emitted, so the keystroke that
-    # resumes writing is marked as having no motor predecessor. Its interval is
-    # measured across days and carries none of the rhythm the engine models.
+    # resumes writing is marked as having no motor predecessor. Its interval
+    # spans the break and carries none of the rhythm the engine models.
     resuming_after_gap = False
 
     for event in script:
         if event.op == ms.OP_PAUSE:
+            if pause_start_ms is None:
+                anchor = timeline.events[-1].keyup_ms if timeline.events else 0.0
+                pause_start_ms = anchor + pending_delay_ms
+            pending_pause_ms += event.duration_ms
             pending_delay_ms += event.duration_ms
             continue
 
@@ -169,8 +180,10 @@ def build_timeline(
                     role=event.role,
                 )
             )
+            # The gap moves the clock but is not a pause; only pending_delay_ms
+            # takes it.
             pending_delay_ms += event.duration_ms
-            # Coming back to the document days later, neither the previous
+            # Coming back to the document after a break, neither the previous
             # keystroke nor the previous typing speed carries over.
             engine.reset_context()
             engine.reset_speed()
@@ -191,12 +204,16 @@ def build_timeline(
         for char, role, kind in actions:
             timing = engine.next_keystroke(char)
 
-            if pending_delay_ms > 0.0 and timeline.events:
+            if pending_pause_ms > 0.0 and timeline.events:
                 timeline.intervals.append(
                     Interval(
                         kind="pause",
-                        start_ms=timeline.events[-1].keyup_ms,
-                        duration_ms=pending_delay_ms,
+                        start_ms=(
+                            pause_start_ms
+                            if pause_start_ms is not None
+                            else timeline.events[-1].keyup_ms
+                        ),
+                        duration_ms=pending_pause_ms,
                         role=role,
                     )
                 )
@@ -207,10 +224,25 @@ def build_timeline(
             else:
                 keydown = last_keydown + pending_delay_ms + timing.iki_ms
                 iki = pending_delay_ms + timing.iki_ms
+            # Whether any silence separated this keystroke from the previous
+            # one, which the rollover test below needs after the counters reset.
+            followed_silence = pending_delay_ms > 0.0
             pending_delay_ms = 0.0
+            pending_pause_ms = 0.0
+            pause_start_ms = None
 
             # Rollover: the previous key is released after this one goes down.
-            if timing.prev_overlap_ms > 0.0 and timeline.events:
+            # The engine decides this from the motor interval alone, which is
+            # all it knows about. A deliberate pause or a session gap lives out
+            # here, so if one intervened the previous key was let go long
+            # before this one was struck - extending it to this keydown would
+            # hold it for the whole silence and produce dwells of seconds
+            # against a model that says 116 ms.
+            if (
+                timing.prev_overlap_ms > 0.0
+                and not followed_silence
+                and timeline.events
+            ):
                 previous = timeline.events[-1]
                 extended = keydown + timing.prev_overlap_ms
                 if extended > previous.keyup_ms:
@@ -242,6 +274,13 @@ def build_timeline(
             last_keydown = keydown
             resuming_after_gap = False
 
+    # A session gap is recorded when its op is seen, but a pause is held back
+    # and recorded when the keystroke that ends it lands. A script with a
+    # PAUSE directly before a SESSION_GAP therefore appends them out of order.
+    # The generator does not currently emit that sequence, but build_timeline
+    # takes any script, and "intervals is in time order" is the contract a
+    # consumer will assume.
+    timeline.intervals.sort(key=lambda interval: interval.start_ms)
     return timeline
 
 
@@ -382,11 +421,21 @@ def generate(
         )
 
     return {
+        # Every argument that shapes the record, so a dataset row can be
+        # regenerated from its own metadata without the command line that
+        # produced it. target_autocorrelation records the engine's resolved
+        # value rather than None when the caller left it at the default.
         "metadata": {
             "profile": profile,
             "seed": seed,
             "typo_rate": typo_rate,
             "r_burst_probability": r_burst_probability,
+            "structural_revision_rate": structural_revision_rate,
+            "session_chars": session_chars,
+            "target_autocorrelation": engine.target_autocorrelation,
+            "fatigue_rate": fatigue_rate,
+            "warmup_strength": warmup_strength,
+            "familiarity_boost": familiarity_boost,
             "input_chars": len(text),
             "input_words": len(text.split()),
         },

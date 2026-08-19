@@ -413,6 +413,59 @@ def test_a_record_without_session_gaps_never_stops(record):
     assert "STOP - " not in render(record)
 
 
+def test_a_session_gap_is_not_also_reported_as_a_thinking_pause(gappy_record):
+    """A break gets one STOP line, not a STOP line and a pause line.
+
+    motor_iki_ms is zeroed on the keystroke that resumes after a gap, so
+    `iki_ms - motor_iki_ms` came out as the whole gap and the renderer
+    announced it a second time as a thinking pause of the same length,
+    immediately under the STOP line that had already reported it.
+    """
+    rendered = render(gappy_record)
+    gap_ms = [
+        i["duration_ms"]
+        for i in gappy_record["intervals"]
+        if i["kind"] == "session_gap"
+    ]
+    assert gap_ms, "the fixture is meant to contain session gaps"
+
+    lines = rendered.splitlines()
+    for position, line in enumerate(lines):
+        if "STOP - " not in line:
+            continue
+        following = lines[position + 1] if position + 1 < len(lines) else ""
+        assert "pause" not in following, (
+            f"gap reported twice:\n  {line.strip()}\n  {following.strip()}"
+        )
+
+    # And no reported pause is as long as any gap in the record.
+    reported = re.findall(r"pause ([\d.]+) min", rendered)
+    shortest_gap_min = min(gap_ms) / 60_000.0
+    assert all(float(value) < shortest_gap_min for value in reported)
+
+
+def test_rendering_stays_linear_in_the_length_of_the_document():
+    """The DOCUMENT column shows a tail, so the whole document must not be
+    rebuilt per keystroke.
+
+    Joining the full buffer on every keystroke is quadratic: a 57k-character
+    essay took sixteen seconds to render.
+    """
+    import time
+
+    def elapsed(text):
+        built = make_record(text, seed=3)
+        start = time.perf_counter()
+        render(built)
+        return time.perf_counter() - start
+
+    small = elapsed(PROSE_FOR_REPLAY * 8)
+    large = elapsed(PROSE_FOR_REPLAY * 32)
+    # Four times the text. Quadratic would be ~16x; allow generous slack for a
+    # loaded machine but nothing like a quadratic blow-up.
+    assert large < max(small * 8.0, 0.5)
+
+
 def test_pauses_are_reported_once_they_are_long_enough(record):
     # The same record renders no pauses at all when the threshold is above
     # every pause in it, which is what makes the threshold the thing deciding.

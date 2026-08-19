@@ -455,3 +455,41 @@ def test_stderr_only_failures_carry_no_traceback():
         assert result.stdout == b""
         assert b"error:" in result.stderr
         assert b"Traceback" not in result.stderr
+
+
+# --- emission flag validation ------------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["0", "0.0", "-1", "-2.5", "nan"])
+def test_emit_speed_must_be_positive(value):
+    """--emit-speed divides the record's clock.
+
+    Zero reached iter_timeline as a division by zero, and only after the
+    desktop emitter's five-second countdown had already run - by which point
+    the user has focused the target window and is waiting to be typed into.
+    """
+    with pytest.raises(SystemExit) as excinfo:
+        build_parser().parse_args(
+            ["--text", "Hi.", "--emit-speed", value]
+        )
+    assert excinfo.value.code == 2
+
+
+@pytest.mark.parametrize("value", ["-1", "-0.5", "nan"])
+def test_emit_max_gap_must_not_be_negative(value):
+    with pytest.raises(SystemExit) as excinfo:
+        build_parser().parse_args(
+            ["--text", "Hi.", "--emit-max-gap-s", value]
+        )
+    assert excinfo.value.code == 2
+
+
+@pytest.mark.parametrize("value", ["0.5", "1", "2.5", "100"])
+def test_valid_emit_speeds_are_accepted(value):
+    args = build_parser().parse_args(["--text", "Hi.", "--emit-speed", value])
+    assert args.emit_speed == float(value)
+
+
+def test_zero_is_a_valid_max_gap():
+    args = build_parser().parse_args(["--text", "Hi.", "--emit-max-gap-s", "0"])
+    assert args.emit_max_gap_s == 0.0

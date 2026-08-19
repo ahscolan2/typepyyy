@@ -95,6 +95,33 @@ def render_record(record: dict, output_format: str) -> str:
     raise ValueError(f"unknown output format {output_format!r}")
 
 
+def _positive_float(value: str) -> float:
+    """An argparse type for a strictly positive number.
+
+    --emit-speed divides the record's clock, so zero or a negative multiplier
+    is not a slow replay but a division by zero inside iter_timeline. Catching
+    it here means the error arrives at the command line rather than after the
+    five-second countdown, with the target window already focused.
+    """
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}")
+    if not number > 0.0 or number != number:
+        raise argparse.ArgumentTypeError(f"must be greater than 0, got {value}")
+    return number
+
+
+def _non_negative_float(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}")
+    if number < 0.0 or number != number:
+        raise argparse.ArgumentTypeError(f"must be 0 or greater, got {value}")
+    return number
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="typetrace",
@@ -218,11 +245,11 @@ Examples:
         help="Google Docs document ID; required with --emit docs",
     )
     parser.add_argument(
-        "--emit-speed", type=float, default=1.0,
+        "--emit-speed", type=_positive_float, default=1.0,
         help="Playback speed multiplier for --emit (default: 1.0)",
     )
     parser.add_argument(
-        "--emit-max-gap-s", type=float, default=None,
+        "--emit-max-gap-s", type=_non_negative_float, default=None,
         help=(
             "Shorten silences longer than this to exactly this many seconds "
             "during --emit (default: keep the record's faithful timing)"

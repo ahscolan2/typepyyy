@@ -20,6 +20,8 @@ htmlcov/
 # Generated records. --output writes wherever it is told; this is the
 # conventional place to put them, and nothing generated belongs in the history.
 datasets/
+# The name the quickstart and the CI smoke test both write to.
+record.json
 
 # Local environment and editor state
 .env

@@ -672,3 +672,58 @@ def test_disabling_every_dynamic_leaves_first_occurrences_untouched(prose):
         type_out(engine, prose)
         assert engine._familiar_digraphs == set()
         assert engine._within_document_factor() == 1.0
+
+
+# --- keyboard geometry stays self-consistent ---------------------------------
+
+
+def test_no_key_is_on_both_hands():
+    assert not (te.LEFT_HAND_KEYS & te.RIGHT_HAND_KEYS)
+
+
+def test_hand_and_finger_agree_about_every_mapped_key():
+    """FINGER_MAP numbers 1-5 left, 6-10 right, 11 thumb.
+
+    'b' used to sit in RIGHT_HAND_KEYS while FINGER_MAP gave it finger 5, a
+    left-hand finger. The two disagreeing made the same-finger branch of
+    _base_delay unreachable for it, so 'gb' and 'tb' - one finger travelling,
+    the slowest digraph class there is - were priced as alternate-hand, the
+    fastest.
+    """
+    engine = TimingEngine(seed=1)
+    for key, finger in te.FINGER_MAP.items():
+        hand = engine._hand(key)
+        if finger == 11:
+            expected = "thumb"
+        elif 1 <= finger <= 5:
+            expected = "left"
+        else:
+            expected = "right"
+        assert hand == expected, (
+            f"{key!r} is finger {finger} but _hand says {hand!r}"
+        )
+
+
+def test_same_finger_digraphs_are_priced_as_same_finger():
+    """The slowest class has to be reachable for every finger on the board."""
+    engine = TimingEngine(seed=1)
+    by_finger = {}
+    for key, finger in te.FINGER_MAP.items():
+        if finger != 11 and key.isalnum():
+            by_finger.setdefault(finger, []).append(key)
+
+    for finger, keys in sorted(by_finger.items()):
+        if len(keys) < 2:
+            continue
+        first, second = keys[0], keys[1]
+        assert engine._base_delay(first, second) == te.BASE_DELAY_SAME_FINGER, (
+            f"{first!r}{second!r} share finger {finger} but are not priced as one"
+        )
+
+
+def test_b_is_a_left_index_key():
+    engine = TimingEngine(seed=1)
+    assert engine._hand("b") == "left"
+    assert te.FINGER_MAP["b"] == te.FINGER_MAP["g"] == te.FINGER_MAP["t"]
+    assert engine._base_delay("g", "b") == te.BASE_DELAY_SAME_FINGER
+    assert engine._base_delay("b", "n") == te.BASE_DELAY_ALTERNATE_HAND

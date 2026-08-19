@@ -163,8 +163,13 @@ FAMILIARITY_BOOST = 0.08
 
 # --- Keyboard geometry -------------------------------------------------------
 
-LEFT_HAND_KEYS = set("qwertasdfgzxcv12345`~!@#$%")
-RIGHT_HAND_KEYS = set("yuiophjklbnm67890-=[]\\;',./^&*()_+{}|:\"<>?")
+# 'b' belongs to the left index finger, which is also what FINGER_MAP says
+# below (finger 5). It used to sit in RIGHT_HAND_KEYS while keeping finger 5,
+# and the two disagreeing made the same-finger branch of _base_delay
+# unreachable for it: 'gb' and 'tb' are one finger travelling, but came out
+# classified as alternate-hand, the fastest class instead of the slowest.
+LEFT_HAND_KEYS = set("qwertasdfgbzxcv12345`~!@#$%")
+RIGHT_HAND_KEYS = set("yuiophjklnm67890-=[]\\;',./^&*()_+{}|:\"<>?")
 
 # Finger numbering: 1-5 left (1 = pinky ... 5 = index reaching inward),
 # 6-10 right (6 = index reaching inward ... 10 = pinky), 11 = thumb.

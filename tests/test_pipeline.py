@@ -18,6 +18,7 @@ import pytest
 
 import macro_scripter as ms
 import pipeline
+import timing_engine as te
 from macro_scripter import MacroScripter, ScriptEvent
 from pipeline import (
     KIND_BACKSPACE,
@@ -210,10 +211,9 @@ def test_motor_interval_is_zero_at_the_start_and_after_every_session_gap(
 
     # Every other zero is a keystroke that resumed after a gap, so its full
     # interval spans at least the shortest gap the scripter can draw - the
-    # hours table's floor, clamped by the fifteen-minute ceiling (currently
-    # the clamp always wins).
+    # minutes table's floor at the lowest jitter.
     shortest_gap_ms = min(
-        min(ms.SESSION_GAP_HOURS) * 0.85 * 3_600_000.0, ms.MAX_SILENCE_MS
+        min(ms.SESSION_GAP_MINUTES) * 0.85 * 60_000.0, ms.MAX_SILENCE_MS
     )
     for event in zeros[1:]:
         assert event["iki_ms"] >= shortest_gap_ms
@@ -255,6 +255,80 @@ def test_pause_intervals_are_counted(record):
     pauses = [i for i in record["intervals"] if i["kind"] == "pause"]
     assert len(pauses) == record["statistics"]["pauses"]
     assert pauses, "prose with word boundaries should contain pauses"
+
+
+def test_a_session_gap_is_not_also_recorded_as_a_pause(gappy_record):
+    """The same silence must not appear twice in the interval list.
+
+    build_timeline used to add the gap's duration to the pending delay that
+    the next keystroke flushes into a "pause" interval, so every gap came out
+    as a session_gap and an identical pause at the same start_ms - inflating
+    statistics["pauses"] and putting phantom fifteen-minute thinking pauses
+    into a record that never contained one.
+    """
+    seen = {}
+    for interval in gappy_record["intervals"]:
+        key = (round(interval["start_ms"], 3), round(interval["duration_ms"], 3))
+        seen.setdefault(key, []).append(interval["kind"])
+    collisions = {k: v for k, v in seen.items() if len(v) > 1}
+    assert not collisions, f"the same silence recorded twice: {collisions}"
+
+    gap_durations = {
+        round(i["duration_ms"], 3)
+        for i in gappy_record["intervals"]
+        if i["kind"] == "session_gap"
+    }
+    for interval in gappy_record["intervals"]:
+        if interval["kind"] == "pause":
+            assert round(interval["duration_ms"], 3) not in gap_durations
+
+
+def test_silences_never_sum_past_the_elapsed_time(gappy_record):
+    """Pauses and gaps are disjoint spans on one clock, so they cannot
+    together outlast the document."""
+    total = sum(i["duration_ms"] for i in gappy_record["intervals"])
+    assert total <= gappy_record["statistics"]["total_time_ms"] + 1.0
+
+
+def test_gap_time_is_only_counted_as_gap_time(gappy_record):
+    gap_ms = sum(
+        i["duration_ms"]
+        for i in gappy_record["intervals"]
+        if i["kind"] == "session_gap"
+    )
+    assert gap_ms == pytest.approx(
+        gappy_record["statistics"]["session_gap_ms"], abs=0.01
+    )
+
+
+# --- dwell stays physical ----------------------------------------------------
+
+
+def test_a_key_is_not_held_down_across_a_thinking_pause(long_prose):
+    """Rollover must not stretch a keyup over a deliberate silence.
+
+    The engine decides rollover from the motor interval alone; the pause and
+    the session gap live in the pipeline. Extending the previous keyup to
+    `keydown + overlap` when a pause intervened held keys down for the whole
+    silence, producing dwells of seconds against a model that says
+    N(116, 20) truncated at 40.
+    """
+    ceiling = te.DWELL_MEAN + 8 * te.DWELL_STD
+    for seed in range(8):
+        record = generate(long_prose, seed=seed, session_chars=SHORT_SESSION)
+        worst = max(e["dwell_ms"] for e in record["keystrokes"])
+        assert worst < ceiling, f"seed {seed} held a key for {worst:.0f} ms"
+
+
+def test_the_keystroke_after_a_silence_never_overlaps_the_one_before(long_prose):
+    record = generate(long_prose, seed=11, session_chars=SHORT_SESSION)
+    events = record["keystrokes"]
+    for previous, event in zip(events, events[1:]):
+        silence = event["iki_ms"] - event["motor_iki_ms"]
+        if silence > 1.0 or event["motor_iki_ms"] == 0.0:
+            assert event["flight_ms"] >= 0.0, (
+                f"keystroke {event['index']} rolled over a {silence:.0f} ms silence"
+            )
 
 
 def test_active_wpm_on_prose_with_pauses_is_below_the_keystroke_rate(long_prose):
@@ -484,9 +558,45 @@ def test_metadata_describes_the_request(long_prose):
         "seed": 9,
         "typo_rate": 0.11,
         "r_burst_probability": 0.22,
+        "structural_revision_rate": ms.STRUCTURAL_REVISION_RATE,
+        "session_chars": None,
+        "target_autocorrelation": te.DEFAULT_TARGET_AUTOCORRELATION,
+        "fatigue_rate": te.FATIGUE_RATE,
+        "warmup_strength": te.WARMUP_STRENGTH,
+        "familiarity_boost": te.FAMILIARITY_BOOST,
         "input_chars": len(long_prose),
         "input_words": len(long_prose.split()),
     }
+
+
+def test_metadata_carries_every_argument_that_shapes_the_record(long_prose):
+    """A row has to be regenerable from its own metadata.
+
+    Six of the ten generation parameters used to be dropped, so a dataset
+    produced with non-default dynamics could not be reproduced from the file
+    that recorded it.
+    """
+    import inspect
+
+    shaping = {
+        name
+        for name in inspect.signature(generate).parameters
+        if name != "text"
+    }
+    assert shaping <= set(generate(long_prose, seed=3)["metadata"])
+
+
+def test_metadata_round_trips_back_into_the_same_record(long_prose):
+    original = generate(
+        long_prose, profile="slow", seed=17, typo_rate=0.07,
+        structural_revision_rate=0.15, fatigue_rate=0.0,
+        warmup_strength=0.25, familiarity_boost=0.0,
+        target_autocorrelation=0.42,
+    )
+    metadata = dict(original["metadata"])
+    metadata.pop("input_chars")
+    metadata.pop("input_words")
+    assert generate(long_prose, **metadata)["keystrokes"] == original["keystrokes"]
 
 
 # --- serialisation -----------------------------------------------------------
@@ -636,3 +746,27 @@ def test_different_dynamics_give_different_records(long_prose):
     first = generate(long_prose, seed=77)
     second = generate(long_prose, seed=77, familiarity_boost=0.0)
     assert first != second
+
+
+def test_intervals_are_in_time_order(gappy_record):
+    starts = [i["start_ms"] for i in gappy_record["intervals"]]
+    assert starts == sorted(starts)
+
+
+def test_intervals_are_in_time_order_for_a_pause_directly_before_a_gap():
+    """A pause is held back until the keystroke that ends it, a gap is
+    recorded where it stands, so this ordering used to come out reversed."""
+    script = [
+        ScriptEvent(ms.OP_TYPE, char="a"),
+        ScriptEvent(ms.OP_PAUSE, duration_ms=500.0),
+        ScriptEvent(ms.OP_SESSION_GAP, duration_ms=300_000.0),
+        ScriptEvent(ms.OP_TYPE, char="b"),
+    ]
+    timeline = build_timeline(script, TimingEngine(seed=1))
+    starts = [i.start_ms for i in timeline.intervals]
+    assert starts == sorted(starts)
+    kinds = [i.kind for i in timeline.intervals]
+    assert kinds == ["pause", "session_gap"]
+    # And the two silences still do not overlap.
+    pause, gap = timeline.intervals
+    assert pause.start_ms + pause.duration_ms == pytest.approx(gap.start_ms)

@@ -397,12 +397,10 @@ def test_generation_through_the_window_matches_the_cli(app, dialogs):
     app.rows["seed"].variable.set("11")
     app._generate()
     got = pump(app)
-    if got is None:  # TEMP DEBUG
-        print("\nDEBUG dialogs:", dialogs)
-        print("DEBUG busy:", app._busy, "qsize:", app._results.qsize())
-        import sys as _s
-        _s.stderr.write("DEBUG params=%r\n" % (app._raw_parameters(),))
-    assert got is not None
+    assert got is not None, (
+        f"no result pumped; dialogs={dialogs} busy={app._busy} "
+        f"queued={app._results.qsize()} params={app._raw_parameters()!r}"
+    )
     assert dialogs == []
     assert app._record == main.generate_full_output(gui.DEFAULT_TEXT, seed=11)
     assert "keystrokes" in app.status.get()

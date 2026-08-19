@@ -18,7 +18,12 @@ type a record into a live editor — see **Replaying into a live editor** below.
 pip install -r requirements.txt
 ```
 
-numpy is the only runtime dependency. Python 3.10 or newer.
+numpy is the only runtime dependency. Python 3.10 or newer. To run the tests
+and the linter as well:
+
+```bash
+pip install -r requirements-dev.txt
+```
 
 Replaying into an editor is optional and pulls in extra dependencies, installed
 separately:
@@ -132,7 +137,10 @@ To pass literal text beginning with `@`, escape it as `\@`.
   "schema_version": 2,
   "metadata": {
     "profile": "average", "seed": 42, "typo_rate": 0.03,
-    "r_burst_probability": 0.2, "input_chars": 12, "input_words": 2
+    "r_burst_probability": 0.2, "structural_revision_rate": 0.08,
+    "session_chars": null, "target_autocorrelation": 0.35,
+    "fatigue_rate": 0.03, "warmup_strength": 0.1, "familiarity_boost": 0.08,
+    "input_chars": 12, "input_words": 2
   },
   "statistics": { "...": "see below" },
   "macro_script": [
@@ -231,9 +239,12 @@ The `DOCUMENT` column is the tail of the document as it stood after that event, 
 `|` for the cursor and `…` where the line was cut. Runs of ordinary typing are folded
 into one line reporting how many characters they covered; a pause, a typo, a revision
 or the end of a session keeps a line of its own. A session gap prints as its own
-`STOP` line, and the timestamp then widens past the minute field — to
-`1:04:12.037` with hours, or `1d 04:12:37` on a multi-day wall clock — rather
-than rolling over.
+`STOP` line and is reported there once; the keystroke that resumes writing is
+not also announced as a thinking pause of the same length. The timestamp widens
+past the minute field rather than rolling over — to `1:04:12.037` with hours,
+and to `1d 04:12:37` for a document long enough to accumulate a day of elapsed
+time, which at a fifteen-minute ceiling on any one break takes a very long
+text.
 
 `--format replay-full` prints one line per keystroke with nothing folded. It is
 thousands of lines for an essay, which is why it is not the default.
@@ -266,22 +277,43 @@ their bands.
 | Boundary pause probability | 0 / 0.2 / 0.4 / 1.0 | model choice: word / clause / sentence / paragraph boundaries inside a burst |
 | Longest recorded silence | 15 min hard cap on any pause or session gap | model choice |
 | Session length | 20–90 min | at 160 chars/min composition |
+| Session gap | 3 / 5 / 8 / 11 / 13 min, weighted 0.22 / 0.28 / 0.24 / 0.16 / 0.10, ±15% jitter | model choice |
+| Common-bigram speedup | 40% faster on 30 frequent English digraphs | model choice |
+| Global interval scale | ×1.7344 on every inter-key interval | calibration, see below |
+
+The last two are applied to the Salthouse baselines rather than replacing them,
+so the effective digraph delays before any other factor are 236 / 291 / 378 ms,
+not 136 / 168 / 218. The scale factor exists because Salthouse measured skilled
+transcription typists and the target here is the Dhakal population mean; it is
+`WPM_CALIBRATION` in `timing_engine.py` and is what makes the `average` profile
+land near 52 WPM. Neither is a literature value.
+
+Session gaps sit under the fifteen-minute ceiling by construction. An earlier
+version drew 0.5–48 hours and let the ceiling clamp the result, which made
+every gap in every record exactly 900000.0 ms — a constant rather than a
+distribution, and an obvious artefact for anything trained on the output.
 
 ### Achieved
 
 Measured over 40 seeds on English prose with default settings. All of these are
 text-dependent, so treat them as bands rather than constants.
 
+Reproduce them with:
+
+```bash
+python benchmark.py
+```
+
 | Quantity | Achieved | Target |
 |---|---|---|
-| `average` profile, keystroke clock | 51.7 WPM [48.8, 55.1] | 52 WPM (Dhakal) |
-| `slow` / `fast` profile | 34.4 / 74.3 WPM | relative |
-| `wpm_active`, whole pipeline | 32.6 [24.9, 41.3] | lower than above; composition pauses and revisions count |
-| Mean dwell | 118.2 ms [116.9, 120.1] | 116 plus genuine rollover extension |
-| Mean motor interval | 246.9 ms [230.8, 258.8] | — |
-| Lag-1 autocorrelation | 0.348 [0.297, 0.391] | 0.35 |
-| Deletion ratio | 0.153 [0.062, 0.262] | 0.10–0.30 reported for real composition |
-| Rollover | ~11% of keystrokes | — |
+| `average` profile, keystroke clock | 50.0 WPM [47.6, 52.7] | 52 WPM (Dhakal) |
+| `slow` / `fast` profile | 33.1 / 71.2 WPM | relative |
+| `wpm_active`, whole pipeline | 33.3 [22.4, 43.7] | lower than above; composition pauses and revisions count |
+| Mean dwell | 117.5 ms [116.6, 118.5] | 116 plus genuine rollover extension |
+| Mean motor interval | 240.5 ms [227.8, 252.0] | — |
+| Lag-1 autocorrelation | 0.353 [0.286, 0.415] | 0.35 |
+| Deletion ratio | 0.155 [0.040, 0.320] | 0.10–0.30 reported for real composition |
+| Rollover | ~13% of keystrokes | — |
 
 Burstiness is modelled as an AR(1) latent speed in log space. `--target-autocorrelation`
 sets the lag-1 autocorrelation of the emitted motor intervals, and the engine solves for
@@ -291,9 +323,11 @@ familiarity speedup. It tracks the target closely across very different texts:
 
 | Target | English prose | Same-finger heavy | Alternation heavy | Punctuation/caps heavy |
 |---|---|---|---|---|
-| 0.35 | 0.345 | 0.356 | 0.346 | 0.357 |
-| 0.50 | 0.505 | 0.505 | 0.515 | 0.492 |
-| 0.65 | 0.650 | 0.643 | 0.649 | 0.644 |
+| 0.35 | 0.354 | 0.373 | 0.337 | 0.347 |
+| 0.50 | 0.513 | 0.524 | 0.526 | 0.473 |
+| 0.65 | 0.643 | 0.656 | 0.652 | 0.630 |
+
+`python benchmark.py` prints this table too.
 
 On top of the stationary model, three within-document dynamics multiply the motor
 interval: a warmup decay over roughly the first minute of a session, a slow fatigue
@@ -317,12 +351,56 @@ burst a syntactic boundary pauses only by roll: never at a plain word boundary
 boundary, more often at a sentence boundary, always at a paragraph break. The
 probabilities are model choices and sit in Inputs next to the pause medians. No
 single silence — pause or session gap — is allowed past fifteen minutes: longer
-draws are clamped to the cap.
+draws are clamped to the cap. Session gaps are drawn from a table that already
+sits under that ceiling, so the clamp guards the rule rather than setting the
+value.
+
+## What this does not model
+
+The model is a good account of *micro-timing* and a partial account of
+*composition*. Anyone using these records as training or evaluation data should
+know where the two come apart.
+
+- **Text is produced linearly from the finished document.** The generator is
+  given the final text and types it. Real writing produces material that is
+  written, discarded, and never appears in the finished piece. Nothing here
+  does that.
+- **Revisions retype identical characters.** Both revision mechanisms delete a
+  span and retype exactly what was there, because that is what keeps the replay
+  invariant true by construction. Real revision changes the words. A deleted
+  span matching its replacement character for character is a strong signal, and
+  it is the mechanism that lifts the deletion ratio into the cited band.
+- **The editing model is backspace-only.** There is no cursor movement, no
+  mouse, no selection, no paste, no `ctrl`-backspace, no held-backspace
+  auto-repeat, no arrow keys, no insertion into earlier text, and no
+  interaction with autocorrect or spellcheck. Real keystroke logs are full of
+  all of these.
+- **Errors are single-character neighbour substitutions**, corrected
+  immediately, on lowercase letters only — no transpositions, omissions,
+  doubling, or errors noticed several characters later. `error_models.py` in
+  this repository implements a wider taxonomy (anticipations, perseverations,
+  exchanges, stutters, homophone confusions), but it is a standalone library:
+  nothing in the CLI, GUI or pipeline imports it, and its own docstring says
+  so. Records produced by `main.py` never contain those error kinds.
+- **US-QWERTY English is the only well-modelled case.** Unmapped characters
+  fall back to a neutral digraph class, and there is no IME, dead-key or
+  alternate-layout behaviour.
+- **A detector trained only on this data learns this model.** The parameters
+  are a small fixed set with published sources for some and stated model
+  choices for the rest; a classifier can learn that signature rather than
+  learning what human writing looks like. Treat these records as a controlled
+  negative or as augmentation, not as a substitute for real keystroke logs.
 
 ## Testing
 
 ```bash
 python -m pytest -q
+```
+
+`benchmark.py` reproduces the Achieved tables above:
+
+```bash
+python benchmark.py
 ```
 
 ## License

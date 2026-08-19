@@ -1,0 +1,7 @@
+# Development dependencies: the runtime ones plus the test runner and linter.
+# Mirrors the [dev] extra in pyproject.toml, for environments that install from
+# requirements files rather than from the package.
+-r requirements.txt
+
+pytest>=7.4.0
+ruff>=0.6
