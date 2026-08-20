@@ -36,6 +36,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Mirrored by requirements-dev.txt for environments that install from
+# requirements files. Keep the two in step.
 dev = [
     "pytest>=7.4",
     "ruff>=0.6",
@@ -61,6 +63,7 @@ typetrace = "main:main"
 # package directory, so that "python main.py" from a checkout keeps working
 # unchanged. py-modules preserves that layout when installed.
 py-modules = [
+    "benchmark",
     "desktop_emitter",
     "docs_emitter",
     "emit_common",
@@ -101,8 +104,14 @@ norecursedirs = [
 target-version = "py310"
 
 [tool.ruff.lint]
-# Restricted to the rules that flag genuine defects - syntax errors, undefined
-# names, broken comparisons - rather than style. The wider default set currently
-# reports stylistic findings across the existing modules, and a lint gate that is
-# red on a clean checkout teaches everyone to ignore it.
-select = ["E9", "F63", "F7", "F82"]
+# The rules that flag genuine defects - syntax errors, undefined names, unused
+# imports and variables, broken comparisons, f-strings with no placeholders -
+# rather than style. Deliberately not the full default set: E501 line-length
+# and the flake8-bugbear opinions are style calls, and a lint gate that is red
+# on a clean checkout teaches everyone to ignore it.
+#
+# This is wider than the previous ["E9", "F63", "F7", "F82"], which caught
+# syntax errors and little else. The whole of pyflakes (F) is clean on this
+# tree, so there is no cost to switching it on and it catches the dead import
+# and the unused local that the narrow set let through.
+select = ["E4", "E7", "E9", "F"]

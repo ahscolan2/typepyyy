@@ -18,6 +18,7 @@ Here there is one event list, one clock, and one invariant:
 """
 
 import math
+import secrets
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -147,18 +148,49 @@ def build_timeline(
     # Time of the most recent keydown. The first keystroke is placed relative
     # to zero rather than to a previous key.
     last_keydown: Optional[float] = None
+    # Total silence owed to the clock before the next keystroke lands, and the
+    # part of it that is thinking pause rather than session gap. A gap already
+    # has its own interval, so folding it into the pause total as well would
+    # record the same silence twice - once as a gap and once as a phantom
+    # fifteen-minute pause at the same start_ms.
     pending_delay_ms = 0.0
+    pending_pause_ms = 0.0
+    pause_start_ms: Optional[float] = None
     # Set when a session gap has just been emitted, so the keystroke that
-    # resumes writing is marked as having no motor predecessor. Its interval is
-    # measured across days and carries none of the rhythm the engine models.
+    # resumes writing is marked as having no motor predecessor. Its interval
+    # spans the break and carries none of the rhythm the engine models.
     resuming_after_gap = False
 
     for event in script:
         if event.op == ms.OP_PAUSE:
+            if pause_start_ms is None:
+                anchor = timeline.events[-1].keyup_ms if timeline.events else 0.0
+                pause_start_ms = anchor + pending_delay_ms
+            pending_pause_ms += event.duration_ms
             pending_delay_ms += event.duration_ms
             continue
 
         if event.op == ms.OP_SESSION_GAP:
+            # A pause accumulated before the gap is flushed here, at its own
+            # anchor, rather than left pending. Held over, the next keystroke
+            # would merge it with any pause after the gap into one interval
+            # anchored before the gap - a span overlapping the gap itself.
+            if pending_pause_ms > 0.0 and timeline.events:
+                timeline.intervals.append(
+                    Interval(
+                        kind="pause",
+                        start_ms=(
+                            pause_start_ms
+                            if pause_start_ms is not None
+                            else timeline.events[-1].keyup_ms
+                        ),
+                        duration_ms=pending_pause_ms,
+                        role=event.role,
+                    )
+                )
+            pending_pause_ms = 0.0
+            pause_start_ms = None
+
             start = last_keydown if last_keydown is not None else 0.0
             start = timeline.events[-1].keyup_ms if timeline.events else start
             timeline.intervals.append(
@@ -169,8 +201,10 @@ def build_timeline(
                     role=event.role,
                 )
             )
+            # The gap moves the clock but is not a pause; only pending_delay_ms
+            # takes it.
             pending_delay_ms += event.duration_ms
-            # Coming back to the document days later, neither the previous
+            # Coming back to the document after a break, neither the previous
             # keystroke nor the previous typing speed carries over.
             engine.reset_context()
             engine.reset_speed()
@@ -191,12 +225,16 @@ def build_timeline(
         for char, role, kind in actions:
             timing = engine.next_keystroke(char)
 
-            if pending_delay_ms > 0.0 and timeline.events:
+            if pending_pause_ms > 0.0 and timeline.events:
                 timeline.intervals.append(
                     Interval(
                         kind="pause",
-                        start_ms=timeline.events[-1].keyup_ms,
-                        duration_ms=pending_delay_ms,
+                        start_ms=(
+                            pause_start_ms
+                            if pause_start_ms is not None
+                            else timeline.events[-1].keyup_ms
+                        ),
+                        duration_ms=pending_pause_ms,
                         role=role,
                     )
                 )
@@ -207,10 +245,25 @@ def build_timeline(
             else:
                 keydown = last_keydown + pending_delay_ms + timing.iki_ms
                 iki = pending_delay_ms + timing.iki_ms
+            # Whether any silence separated this keystroke from the previous
+            # one, which the rollover test below needs after the counters reset.
+            followed_silence = pending_delay_ms > 0.0
             pending_delay_ms = 0.0
+            pending_pause_ms = 0.0
+            pause_start_ms = None
 
             # Rollover: the previous key is released after this one goes down.
-            if timing.prev_overlap_ms > 0.0 and timeline.events:
+            # The engine decides this from the motor interval alone, which is
+            # all it knows about. A deliberate pause or a session gap lives out
+            # here, so if one intervened the previous key was let go long
+            # before this one was struck - extending it to this keydown would
+            # hold it for the whole silence and produce dwells of seconds
+            # against a model that says 116 ms.
+            if (
+                timing.prev_overlap_ms > 0.0
+                and not followed_silence
+                and timeline.events
+            ):
                 previous = timeline.events[-1]
                 extended = keydown + timing.prev_overlap_ms
                 if extended > previous.keyup_ms:
@@ -242,6 +295,13 @@ def build_timeline(
             last_keydown = keydown
             resuming_after_gap = False
 
+    # A session gap is recorded when its op is seen, but a pause is held back
+    # and recorded when the keystroke that ends it lands. A script with a
+    # PAUSE directly before a SESSION_GAP therefore appends them out of order.
+    # The generator does not currently emit that sequence, but build_timeline
+    # takes any script, and "intervals is in time order" is the contract a
+    # consumer will assume.
+    timeline.intervals.sort(key=lambda interval: interval.start_ms)
     return timeline
 
 
@@ -256,11 +316,19 @@ def lag1_autocorrelation(values: List[float]) -> float:
     series = [math.log(v) for v in values if v > 0.0]
     if len(series) < 3:
         return 0.0
-    mean = sum(series) / len(series)
-    denominator = sum((x - mean) ** 2 for x in series)
+    # A constant series has no variance and no autocorrelation. This has to be
+    # decided by comparison, not by the denominator underflowing to zero:
+    # before Python 3.12 made sum() compensated, the computed mean of fifty
+    # identical values could sit one ulp off the value itself, leaving every
+    # centred term the same tiny nonzero constant - and the ratio of those is
+    # (n-1)/n, reported as a 0.98 correlation in a series with no signal.
+    if min(series) == max(series):
+        return 0.0
+    mean = math.fsum(series) / len(series)
+    denominator = math.fsum((x - mean) ** 2 for x in series)
     if denominator <= 0.0:
         return 0.0
-    numerator = sum(
+    numerator = math.fsum(
         (series[i] - mean) * (series[i + 1] - mean) for i in range(len(series) - 1)
     )
     return numerator / denominator
@@ -345,6 +413,16 @@ def generate(
     if not isinstance(text, str):
         raise TypeError(f"text must be str, got {type(text).__name__}")
 
+    # An unseeded run draws its seed here and records it, for the same reason
+    # target_autocorrelation below records the engine's resolved value rather
+    # than None: the metadata block promises that a record can be regenerated
+    # from its own metadata, and "seed": null cannot keep that promise - the
+    # scripter and the engine would each reseed from OS entropy and produce a
+    # different record. Two unseeded runs still differ, because each draws its
+    # own seed.
+    if seed is None:
+        seed = secrets.randbelow(2**32)
+
     scripter = MacroScripter(
         seed=seed,
         typo_rate=typo_rate,
@@ -382,11 +460,21 @@ def generate(
         )
 
     return {
+        # Every argument that shapes the record, so a dataset row can be
+        # regenerated from its own metadata without the command line that
+        # produced it. target_autocorrelation records the engine's resolved
+        # value rather than None when the caller left it at the default.
         "metadata": {
             "profile": profile,
             "seed": seed,
             "typo_rate": typo_rate,
             "r_burst_probability": r_burst_probability,
+            "structural_revision_rate": structural_revision_rate,
+            "session_chars": session_chars,
+            "target_autocorrelation": engine.target_autocorrelation,
+            "fatigue_rate": fatigue_rate,
+            "warmup_strength": warmup_strength,
+            "familiarity_boost": familiarity_boost,
             "input_chars": len(text),
             "input_words": len(text.split()),
         },

@@ -12,13 +12,24 @@ concurrency:
 
 jobs:
   test:
-    name: Test (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    # A hung job should fail in minutes, not sit on the runner for the
+    # six-hour default.
+    timeout-minutes: 30
     strategy:
       # One interpreter failing should not hide the result on the others.
       fail-fast: false
       matrix:
+        # Windows is the platform the desktop emitter and the GUI are used
+        # on, so it carries the interpreter matrix. Both Windows and macOS
+        # runners have a display, so the tkinter suite runs everywhere with
+        # no virtual-display setup.
+        os: [windows-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
     steps:
       - uses: actions/checkout@v4
 
@@ -26,38 +37,71 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-          cache-dependency-path: requirements.txt
+          # Both files: requirements-dev.txt pulls requirements.txt in with
+          # -r, so hashing only the former would keep a stale cache when the
+          # runtime pins move.
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
 
       - name: Run tests
         run: pytest -q
 
-      - name: Smoke-test the CLI
-        # The suite covers the modules; this covers the packaged entry point on
-        # each interpreter, and checks the guarantee the pipeline is built
-        # around: the replayed keystrokes reproduce the input.
+      # The suite covers the modules; this covers the packaged entry point on
+      # each interpreter, and checks the guarantee the pipeline is built
+      # around: the replayed keystrokes reproduce the input.
+      - name: Install the package and smoke-test the console script
         run: |
-          python main.py \
-            --text "The quick brown fox jumps over the lazy dog." \
-            --seed 42 \
-            --output record.json
-          python - <<'PY'
+          pip install .
+          typetrace --text "The quick brown fox jumps over the lazy dog." --seed 42 --output record.json
+
+      - name: Check the record reproduces its own input
+        shell: python
+        run: |
           import json
 
           record = json.load(open("record.json", encoding="utf-8"))
+          target = "The quick brown fox jumps over the lazy dog."
+
           assert record["synthetic_research_data"] is True, "watermark missing"
-          assert record["target_text"] == "The quick brown fox jumps over the lazy dog."
+          assert record["target_text"] == target
           assert record["statistics"]["keystrokes"] > 0, "no keystrokes generated"
+
+          # Replay the keystroke stream and require the document back exactly.
+          # A regression that emits a corrupted, misaligned, or
+          # unreconstructible stream fails here rather than passing on a count
+          # of keystrokes greater than zero.
+          buffer = []
+          for keystroke in record["keystrokes"]:
+              if keystroke["kind"] == "backspace":
+                  if buffer:
+                      buffer.pop()
+              else:
+                  buffer.append(keystroke["char"])
+          produced = "".join(buffer)
+          assert produced == target, f"replay produced {produced!r}"
+
+          # No silence may run past the fifteen-minute ceiling, and no key may
+          # be held for anything like a human dwell time.
+          for interval in record["intervals"]:
+              assert interval["duration_ms"] <= 900_000.0 + 1.0, interval
+          worst = max(k["dwell_ms"] for k in record["keystrokes"])
+          assert worst < 400.0, f"a key was held for {worst:.0f} ms"
+
           print(record["statistics"]["keystrokes"], "keystrokes generated")
-          PY
+
+      - name: Smoke-test the benchmark
+        run: python benchmark.py --seeds 4 --repeat 1 --skip-tracking
 
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 

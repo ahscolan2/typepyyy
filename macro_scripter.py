@@ -81,9 +81,10 @@ BOUNDARY_PAUSE_PROBABILITIES = {
 
 # Hard ceiling on any single recorded silence - thinking pause or session
 # gap - in milliseconds. The product rule is that no fifteen-minute-plus
-# pause appears in a record: the session-gap table below draws 0.5-48 hours
-# and is clamped here, so every gap currently lands on the cap exactly. The
-# lognormal pause sampler reaches the ceiling only in its far tail.
+# silence appears in a record. The session-gap table below is expressed in
+# minutes and drawn entirely below this ceiling, so the clamp is a guard
+# rather than the thing that decides the value. The lognormal pause sampler
+# reaches the ceiling only in its far tail.
 MAX_SILENCE_MS = 900_000.0
 
 # Reaction time before noticing and fixing a typo, ms.
@@ -109,10 +110,18 @@ REVISION_FRACTION_RANGE = (0.4, 1.0)
 SESSION_MINUTES_RANGE = (20.0, 90.0)
 NOMINAL_COMPOSITION_CPM = 160.0
 
-# Gaps between sessions, in hours, with the weights of a student working over
-# several days: mostly overnight or next-evening, occasionally a short break.
-SESSION_GAP_HOURS = (0.5, 1.0, 2.0, 4.0, 16.0, 24.0, 48.0)
-SESSION_GAP_WEIGHTS = (0.10, 0.12, 0.15, 0.15, 0.18, 0.20, 0.10)
+# Gaps between sessions, in minutes. A break long enough that the typist's
+# rhythm and digraph context do not carry over, but still inside the fifteen
+# minute ceiling on any recorded silence: getting up, making coffee, taking a
+# call. The weights lean short, because most interruptions are.
+#
+# An earlier revision drew 0.5-48 hours here and let MAX_SILENCE_MS clamp the
+# result. Every gap then came out at exactly 900000.0 ms, which is a constant
+# rather than a distribution and is trivially learnable by anything trained on
+# these records. The table is now written in the units it is actually sampled
+# in, so what the record contains is what this table says.
+SESSION_GAP_MINUTES = (3.0, 5.0, 8.0, 11.0, 13.0)
+SESSION_GAP_WEIGHTS = (0.22, 0.28, 0.24, 0.16, 0.10)
 
 SENTENCE_ENDERS = frozenset(".!?")
 CLAUSE_ENDERS = frozenset(",;:")
@@ -484,13 +493,15 @@ class MacroScripter:
         return events
 
     def _sample_session_gap_ms(self) -> float:
-        hours = self._rng.choices(SESSION_GAP_HOURS, weights=SESSION_GAP_WEIGHTS)[0]
-        # Jitter so gaps are not all exactly round numbers of hours.
-        hours *= self._rng.uniform(0.85, 1.15)
-        # MAX_SILENCE_MS caps the gap at fifteen minutes. The hours table
-        # draws 0.5-48 h, so every gap currently lands on the cap; the table
-        # and jitter stay so that raising the ceiling reactivates the spread.
-        return min(hours * 3_600_000.0, MAX_SILENCE_MS)
+        minutes = self._rng.choices(
+            SESSION_GAP_MINUTES, weights=SESSION_GAP_WEIGHTS
+        )[0]
+        # Jitter so gaps are not all exactly round numbers of minutes.
+        minutes *= self._rng.uniform(0.85, 1.15)
+        # The table tops out at 13 minutes and the jitter at +15%, so this is
+        # a guard on the product rule rather than the thing that sets the
+        # value: gaps keep their spread instead of piling up on the ceiling.
+        return min(minutes * 60_000.0, MAX_SILENCE_MS)
 
     def _revise(
         self,

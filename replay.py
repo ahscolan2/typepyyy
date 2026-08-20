@@ -119,18 +119,49 @@ def visible_tail(text: str, width: int) -> str:
     return f"{prefix}{rendered}{CURSOR}"
 
 
-def _moments(record: Dict[str, Any], pause_threshold_ms: float) -> List[dict]:
+def _moments(
+    record: Dict[str, Any],
+    pause_threshold_ms: float,
+    width: int = DEFAULT_WIDTH,
+) -> List[dict]:
     """Time-ordered notable events, each already carrying the document state.
 
     Keystrokes and intervals are merged onto one ordering so a pause appears
     between the keystrokes it separates rather than in a list of its own.
+
+    Only the tail of the document is kept per moment. The DOCUMENT column
+    shows the last `width` characters and marks anything before them with an
+    ellipsis, so carrying the whole document forward on every keystroke costs
+    a full string build per keystroke - quadratic in the length of the essay,
+    which is what made rendering a 57k-character document take sixteen
+    seconds. One character past the width is enough for visible_tail to still
+    see that it truncated.
     """
     keystrokes = record["keystrokes"]
     gaps = [i for i in record.get("intervals", []) if i["kind"] == "session_gap"]
+    keep = max(width, 0) + 1
+
+    # Thinking pauses come from the record's own interval list, which the
+    # pipeline writes in time order, one entry per pause, gaps excluded.
+    # Deriving them from iki_ms - motor_iki_ms instead goes wrong at a session
+    # boundary twice over: the difference contains the whole gap (already
+    # reported on its own STOP line), and motor_iki_ms is a sentinel 0.0 on the
+    # resuming keystroke, so what is left over after subtracting the gap is
+    # that keystroke's motor interval masquerading as thought. The derivation
+    # survives below only for a record with no interval list at all.
+    pauses = (
+        [i for i in record["intervals"] if i["kind"] == "pause"]
+        if "intervals" in record
+        else None
+    )
+    pause_index = 0
 
     moments: List[dict] = []
     buffer: List[str] = []
     gap_index = 0
+    # Fallback bookkeeping only: duration of a session gap that has been
+    # reported but whose silence is still sitting in the next iki_ms.
+    gap_carry_ms = 0.0
 
     for position, event in enumerate(keystrokes):
         # Any session gap that started before this keystroke belongs here.
@@ -139,8 +170,9 @@ def _moments(record: Dict[str, Any], pause_threshold_ms: float) -> List[dict]:
                 "kind": "session_gap",
                 "at_ms": gaps[gap_index]["start_ms"],
                 "duration_ms": gaps[gap_index]["duration_ms"],
-                "text": "".join(buffer),
+                "text": "".join(buffer[-keep:]),
             })
+            gap_carry_ms += gaps[gap_index]["duration_ms"]
             gap_index += 1
 
         is_backspace = event["kind"] == "backspace"
@@ -151,7 +183,23 @@ def _moments(record: Dict[str, Any], pause_threshold_ms: float) -> List[dict]:
             buffer.append(event["char"])
 
         role = event["role"]
-        pause_ms = event["iki_ms"] - event["motor_iki_ms"]
+        if pauses is not None:
+            # Every pause interval that ended before this keydown belongs to
+            # this keystroke: the pipeline flushes a pause when the keystroke
+            # that ends it lands, so its start always precedes that keydown.
+            pause_ms = 0.0
+            while (
+                pause_index < len(pauses)
+                and pauses[pause_index]["start_ms"] < event["keydown_ms"]
+            ):
+                pause_ms += pauses[pause_index]["duration_ms"]
+                pause_index += 1
+            gap_carry_ms = 0.0
+        else:
+            pause_ms = event["iki_ms"] - event["motor_iki_ms"] - gap_carry_ms
+            gap_carry_ms = 0.0
+            if pause_ms < 0.0:
+                pause_ms = 0.0
 
         if position == 0:
             kind = "begin"
@@ -175,7 +223,7 @@ def _moments(record: Dict[str, Any], pause_threshold_ms: float) -> List[dict]:
             "char": event["char"],
             "is_backspace": is_backspace,
             "role": role,
-            "text": "".join(buffer),
+            "text": "".join(buffer[-keep:]),
             "index": position,
         })
 
@@ -184,7 +232,7 @@ def _moments(record: Dict[str, Any], pause_threshold_ms: float) -> List[dict]:
             "kind": "session_gap",
             "at_ms": gaps[gap_index]["start_ms"],
             "duration_ms": gaps[gap_index]["duration_ms"],
-            "text": "".join(buffer),
+            "text": "".join(buffer[-keep:]),
         })
         gap_index += 1
 
@@ -302,7 +350,7 @@ def render(
         "",
     ]
 
-    moments = _moments(record, pause_threshold_ms)
+    moments = _moments(record, pause_threshold_ms, width)
     if not full:
         moments = _collapse(moments)
 

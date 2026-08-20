@@ -591,15 +591,47 @@ def test_session_gap_durations_are_plausible(long_prose):
     script = MacroScripter(seed=6, session_chars=60).generate_script(long_prose)
     gaps = [e.duration_ms for e in script if e.op == ms.OP_SESSION_GAP]
     assert gaps
-    # SESSION_GAP_HOURS draws 0.5-48 h even at the lowest jitter, and the
-    # fifteen-minute ceiling clamps every one of those draws, so with the
-    # current table each gap lands exactly on the cap.
-    assert all(gap == ms.MAX_SILENCE_MS for gap in gaps)
+    # The table is drawn in minutes below the ceiling, so the clamp is a guard
+    # and not the thing that picks the value.
+    assert all(0.0 < gap <= ms.MAX_SILENCE_MS for gap in gaps)
+    floor_ms = min(ms.SESSION_GAP_MINUTES) * 0.85 * 60_000.0
+    assert all(gap >= floor_ms for gap in gaps)
 
 
-def test_session_gap_weights_match_the_hours():
-    assert len(ms.SESSION_GAP_HOURS) == len(ms.SESSION_GAP_WEIGHTS)
+def test_session_gaps_are_not_all_the_same_length(long_prose):
+    """A gap distribution that always returns its ceiling is a constant.
+
+    Drawing 0.5-48 hours and clamping at fifteen minutes made every gap in
+    every record exactly 900000.0 ms, which is both wrong and trivially
+    learnable by anything trained on these records.
+
+    Distinctness alone would not catch a near-degenerate table - the
+    continuous jitter makes any two unclamped draws distinct floats - so the
+    assertions here are about spread: the gaps have to range across several
+    minutes, none may sit on the ceiling, and more than one table entry has
+    to actually be drawn.
+    """
+    script = MacroScripter(seed=6, session_chars=40).generate_script(long_prose * 4)
+    gaps = [e.duration_ms for e in script if e.op == ms.OP_SESSION_GAP]
+    assert len(gaps) >= 10, "fixture is meant to produce many gaps"
+    assert not any(gap == ms.MAX_SILENCE_MS for gap in gaps)
+    # The table spans 3-13 minutes; a dozen draws should cover most of it.
+    spread_ms = max(gaps) - min(gaps)
+    assert spread_ms > 4 * 60_000.0, f"gaps span only {spread_ms / 60_000.0:.2f} min"
+    # And the spread comes from the table, not just the +/-15% jitter: the
+    # jitter alone cannot stretch one entry across a 1.5x ratio.
+    assert max(gaps) / min(gaps) > 1.5
+
+
+def test_session_gap_weights_match_the_minutes():
+    assert len(ms.SESSION_GAP_MINUTES) == len(ms.SESSION_GAP_WEIGHTS)
     assert sum(ms.SESSION_GAP_WEIGHTS) == pytest.approx(1.0)
+
+
+def test_session_gap_table_stays_under_the_silence_ceiling():
+    """The product rule: no recorded silence runs past fifteen minutes."""
+    highest_ms = max(ms.SESSION_GAP_MINUTES) * 1.15 * 60_000.0
+    assert highest_ms <= ms.MAX_SILENCE_MS
 
 
 # --- constructor validation --------------------------------------------------
