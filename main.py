@@ -66,6 +66,7 @@ def generate_full_output(
     fatigue_rate: float = te.FATIGUE_RATE,
     warmup_strength: float = te.WARMUP_STRENGTH,
     familiarity_boost: float = te.FAMILIARITY_BOOST,
+    typo_model: str = ms.TYPO_MODEL_DEFAULT,
 ) -> dict:
     """Generate one watermarked synthetic record for `text`."""
     record = pipeline.generate(
@@ -80,6 +81,7 @@ def generate_full_output(
         fatigue_rate=fatigue_rate,
         warmup_strength=warmup_strength,
         familiarity_boost=familiarity_boost,
+        typo_model=typo_model,
     )
     return {**WATERMARK, **record}
 
@@ -171,6 +173,16 @@ Examples:
     parser.add_argument(
         "--typo-rate", type=float, default=ms.TYPO_RATE,
         help=f"Per-character typo probability (default: {ms.TYPO_RATE})",
+    )
+    parser.add_argument(
+        "--typo-model", choices=list(ms.TYPO_MODELS),
+        default=ms.TYPO_MODEL_DEFAULT,
+        help=(
+            "Error repertoire the typo budget is spent on: 'neighbor' is the "
+            "single-character neighbour-key slip, 'rich' adds exchanges, "
+            "stutters, anticipations and perseverations from error_models "
+            f"(default: {ms.TYPO_MODEL_DEFAULT})"
+        ),
     )
     parser.add_argument(
         "--r-burst-probability", type=float, default=ms.R_BURST_PROBABILITY,
@@ -333,6 +345,7 @@ def main(argv: Optional[list] = None) -> int:
             profile=args.profile,
             seed=args.seed,
             typo_rate=args.typo_rate,
+            typo_model=args.typo_model,
             r_burst_probability=args.r_burst_probability,
             session_chars=args.session_chars,
             target_autocorrelation=args.target_autocorrelation,

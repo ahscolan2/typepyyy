@@ -404,6 +404,7 @@ def generate(
     fatigue_rate: float = te.FATIGUE_RATE,
     warmup_strength: float = te.WARMUP_STRENGTH,
     familiarity_boost: float = te.FAMILIARITY_BOOST,
+    typo_model: str = ms.TYPO_MODEL_DEFAULT,
 ) -> dict:
     """Generate the full synthetic record for `text`.
 
@@ -429,6 +430,7 @@ def generate(
         r_burst_probability=r_burst_probability,
         structural_revision_rate=structural_revision_rate,
         session_chars=session_chars,
+        typo_model=typo_model,
     )
     engine_kwargs = {
         "profile": profile,
@@ -468,6 +470,7 @@ def generate(
             "profile": profile,
             "seed": seed,
             "typo_rate": typo_rate,
+            "typo_model": typo_model,
             "r_burst_probability": r_burst_probability,
             "structural_revision_rate": structural_revision_rate,
             "session_chars": session_chars,

@@ -109,6 +109,17 @@ def _number(raw: str) -> float:
         raise ValueError(f"{raw!r} is not a number") from None
 
 
+def _typo_model_name(raw: str) -> str:
+    return raw.strip().lower()
+
+
+def _typo_model(value: str) -> Optional[str]:
+    if value in ms.TYPO_MODELS:
+        return None
+    options = " or ".join(repr(name) for name in ms.TYPO_MODELS)
+    return f"must be {options}, got {value!r}"
+
+
 def _probability(value: float) -> Optional[str]:
     if 0.0 <= value <= 1.0:
         return None
@@ -174,6 +185,15 @@ GENERATOR_FIELDS: Tuple[Field, ...] = (
         hint="per character, 0-1",
         parse=_number,
         check=_probability,
+        blank_is_default=True,
+    ),
+    Field(
+        key="typo_model",
+        label="Typo model",
+        default=ms.TYPO_MODEL_DEFAULT,
+        hint="neighbor or rich; rich adds the cognitive error kinds",
+        parse=_typo_model_name,
+        check=_typo_model,
         blank_is_default=True,
     ),
     Field(

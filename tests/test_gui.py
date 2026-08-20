@@ -97,6 +97,7 @@ def test_defaults_match_the_cli_parser():
         "profile": args.profile,
         "seed": args.seed,
         "typo_rate": args.typo_rate,
+        "typo_model": args.typo_model,
         "r_burst_probability": args.r_burst_probability,
         "structural_revision_rate": args.structural_revision_rate,
         "session_chars": args.session_chars,
@@ -107,12 +108,20 @@ def test_defaults_match_the_cli_parser():
     }
 
 
+def test_a_bogus_typo_model_is_rejected_with_a_message():
+    raw = gui.default_parameter_strings()
+    raw["typo_model"] = "cognitive"
+    with pytest.raises(ValueError, match="'neighbor' or 'rich'"):
+        gui.collect_parameters(raw)
+
+
 def test_collect_parameters_parses_every_field():
     raw = gui.default_parameter_strings()
     raw.update({
         "profile": "fast",
         "seed": "42",
         "typo_rate": "0.05",
+        "typo_model": "Rich",
         "r_burst_probability": "0.4",
         "structural_revision_rate": "0.0",
         "session_chars": "500",
@@ -125,6 +134,7 @@ def test_collect_parameters_parses_every_field():
         "profile": "fast",
         "seed": 42,
         "typo_rate": 0.05,
+        "typo_model": "rich",
         "r_burst_probability": 0.4,
         "structural_revision_rate": 0.0,
         "session_chars": 500,

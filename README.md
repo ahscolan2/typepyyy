@@ -110,6 +110,7 @@ a fifteen-minute session gap, say — to exactly five seconds.
 | `--output`, `-o` | Write here instead of stdout | stdout |
 | `--force`, `-f` | Overwrite the output file if it exists | off |
 | `--typo-rate` | Per-character typo probability | `0.03` |
+| `--typo-model` | `neighbor` or `rich`; which error repertoire the typo budget is spent on | `neighbor` |
 | `--r-burst-probability` | Probability a burst ends in a revision | `0.20` |
 | `--structural-revision-rate` | Probability at each completed sentence of deleting it back whole and retyping it; 0 disables | `0.08` |
 | `--session-chars` | Force a session to end after this many characters | none |
@@ -137,6 +138,7 @@ To pass literal text beginning with `@`, escape it as `\@`.
   "schema_version": 2,
   "metadata": {
     "profile": "average", "seed": 42, "typo_rate": 0.03,
+    "typo_model": "neighbor",
     "r_burst_probability": 0.2, "structural_revision_rate": 0.08,
     "session_chars": null, "target_autocorrelation": 0.35,
     "fatigue_rate": 0.03, "warmup_strength": 0.1, "familiarity_boost": 0.08,
@@ -269,6 +271,7 @@ their bands.
 | R-burst length | 3–7 words | Chenoweth & Hayes |
 | R-burst probability | 0.20 | Leijten & Van Waes |
 | Structural revision rate | 0.08 at each completed sentence | model choice |
+| Rich typo taxonomy (`--typo-model rich`) | exchange, stutter, anticipation (2–3 ahead), perseveration (1–2 back), plus the neighbour slip; uniform over whichever apply at a position | model choice: kinds follow Dell (1986) and Salthouse (1986), the mix does not |
 | — of which reaches back across a paragraph break | 0.30 | model choice |
 | Fatigue | +3% motor intervals per 10 min of active typing | model choice |
 | Warmup | +10% at the start, decaying with τ = 25 s | model choice |
@@ -337,6 +340,14 @@ drift upward with elapsed active-typing time, and a familiarity speedup on digra
 already typed in this document. The familiarity cache is document-level and survives
 session gaps; the other two clocks reset with each session. All three are model
 choices (see Inputs) and each is disabled by setting its flag to zero.
+
+Typos default to the single-character neighbour-key slip, corrected
+immediately. `--typo-model rich` spends the same `--typo-rate` budget across
+`error_models`' wider taxonomy - exchanges ("teh"), stutters ("nno"),
+anticipations and perseverations - choosing uniformly among whichever kinds
+are physically applicable at each position, still corrected immediately. The
+default is unchanged by the flag's existence: a seeded record generated with
+`neighbor` (or with no flag) is identical to what earlier releases produced.
 
 Revision happens at two scales. An R-burst deletes back a fraction of the burst just
 written and retypes it. A structural revision (`--structural-revision-rate`), rolled

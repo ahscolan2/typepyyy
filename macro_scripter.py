@@ -95,6 +95,20 @@ REVISION_PAUSE_RANGE = (400.0, 1500.0)
 
 TYPO_RATE = 0.03
 
+# Which repertoire of typing errors _maybe fires when the typo budget rolls.
+# "neighbor" is the original single-character neighbour-key substitution.
+# "rich" adds error_models' cognitive kinds - exchange, stutter, anticipation,
+# perseveration - splitting the same TYPO_RATE budget across whichever kinds
+# are physically applicable at each position. The default stays "neighbor"
+# and, with it, the generated script for a given seed stays byte-identical to
+# what it was before "rich" existed.
+TYPO_MODELS = ("neighbor", "rich")
+TYPO_MODEL_DEFAULT = "neighbor"
+
+# The kind name the counter below uses for a plain neighbour-key slip, next
+# to error_models' KIND_* names for the cognitive kinds.
+KIND_NEIGHBOR = "neighbor"
+
 # Fraction of a completed R-burst that gets deleted and retyped.
 #
 # With R_BURST_PROBABILITY at the cited 0.20, this burst-local revision alone
@@ -251,9 +265,14 @@ class MacroScripter:
         r_burst_probability: float = R_BURST_PROBABILITY,
         session_chars: Optional[int] = None,
         structural_revision_rate: float = STRUCTURAL_REVISION_RATE,
+        typo_model: str = TYPO_MODEL_DEFAULT,
     ):
         if not 0.0 <= typo_rate <= 1.0:
             raise ValueError(f"typo_rate must be in [0, 1], got {typo_rate}")
+        if typo_model not in TYPO_MODELS:
+            raise ValueError(
+                f"typo_model must be one of {TYPO_MODELS}, got {typo_model!r}"
+            )
         if not 0.0 <= r_burst_probability <= 1.0:
             raise ValueError(
                 f"r_burst_probability must be in [0, 1], got {r_burst_probability}"
@@ -271,6 +290,20 @@ class MacroScripter:
         self.r_burst_probability = r_burst_probability
         self.structural_revision_rate = structural_revision_rate
         self.session_chars = session_chars
+        self.typo_model = typo_model
+        # What each fired error was, by kind name, filled in as generate_script
+        # runs. Not part of the record - the schema does not change - but a
+        # test or a curious caller can read the mix off the scripter directly.
+        self.error_kinds: Dict[str, int] = {}
+        # The rich model draws its candidates from error_models, which imports
+        # this module for the ScriptEvent vocabulary - so the import back must
+        # be lazy, exactly like main.py's emitter imports, or the two modules
+        # would form a cycle at load time.
+        if typo_model == "rich":
+            import error_models
+            self._error_models = error_models
+        else:
+            self._error_models = None
 
     # -- sampling ------------------------------------------------------------
 
@@ -306,6 +339,36 @@ class MacroScripter:
         if typo == char:
             return None
         return typo
+
+    def _rich_error(self, text: str, index: int):
+        """One planned error at `text[index]` under the rich model, or None.
+
+        Spends the same budget as _maybe_typo - a single Bernoulli(typo_rate)
+        roll per position - and on a hit chooses uniformly among everything
+        physically applicable there: the cognitive kinds from
+        error_models.candidate_edits plus the plain neighbour-key slip. A
+        position where nothing applies (whitespace, punctuation, an isolated
+        letter) consumes the roll and produces nothing, exactly as the
+        neighbour model consumes its roll on a character with no neighbours.
+        """
+        if self._rng.random() >= self.typo_rate:
+            return None
+        em = self._error_models
+        options: list = list(em.candidate_edits(text, index))
+        char = text[index]
+        if NEIGHBOR_KEYS.get(char.lower()):
+            options.append(KIND_NEIGHBOR)
+        if not options:
+            return None
+        choice = self._rng.choice(options)
+        if choice == KIND_NEIGHBOR:
+            typo = self._rng.choice(NEIGHBOR_KEYS[char.lower()])
+            if char.isupper():
+                typo = typo.upper()
+            if typo == char:
+                return None
+            choice = em.ErrorEdit(KIND_NEIGHBOR, index, char, typo)
+        return choice
 
     def _burst_limit(self) -> tuple:
         """Return (word_limit, is_revision_burst) for the next burst."""
@@ -435,9 +498,46 @@ class MacroScripter:
                 words_in_burst = 0
                 burst_start = committed
 
+            # Characters an error at an earlier position already produced -
+            # the second half of an exchange - and which therefore must not be
+            # typed (or rolled for) again. Always 0 under the neighbour model.
+            consumed_by_error = 0
             for char in token:
+                if consumed_by_error:
+                    consumed_by_error -= 1
+                    continue
+
+                if self.typo_model == "rich":
+                    # `committed` is the absolute offset of this character in
+                    # `text` - the revision machinery already relies on that -
+                    # so the error model sees real surrounding context, not
+                    # just the token.
+                    edit = self._rich_error(text, committed)
+                    if edit is not None:
+                        events.extend(
+                            self._error_models.edit_correction_events(
+                                edit,
+                                self._rng.uniform(*TYPO_REACTION_RANGE),
+                            )
+                        )
+                        self.error_kinds[edit.kind] = (
+                            self.error_kinds.get(edit.kind, 0) + 1
+                        )
+                        span = len(edit.intended)
+                        committed += span
+                        chars_this_session += span
+                        consumed_by_error = span - 1
+                    else:
+                        events.append(ScriptEvent(OP_TYPE, char=char))
+                        committed += 1
+                        chars_this_session += 1
+                    continue
+
                 typo = self._maybe_typo(char)
                 if typo is not None:
+                    self.error_kinds[KIND_NEIGHBOR] = (
+                        self.error_kinds.get(KIND_NEIGHBOR, 0) + 1
+                    )
                     events.append(
                         ScriptEvent(OP_TYPE, char=typo, role=ROLE_TYPO)
                     )

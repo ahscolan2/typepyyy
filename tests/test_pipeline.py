@@ -577,6 +577,7 @@ def test_metadata_describes_the_request(long_prose):
         "profile": "fast",
         "seed": 9,
         "typo_rate": 0.11,
+        "typo_model": ms.TYPO_MODEL_DEFAULT,
         "r_burst_probability": 0.22,
         "structural_revision_rate": ms.STRUCTURAL_REVISION_RATE,
         "session_chars": None,
