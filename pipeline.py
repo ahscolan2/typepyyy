@@ -316,11 +316,19 @@ def lag1_autocorrelation(values: List[float]) -> float:
     series = [math.log(v) for v in values if v > 0.0]
     if len(series) < 3:
         return 0.0
-    mean = sum(series) / len(series)
-    denominator = sum((x - mean) ** 2 for x in series)
+    # A constant series has no variance and no autocorrelation. This has to be
+    # decided by comparison, not by the denominator underflowing to zero:
+    # before Python 3.12 made sum() compensated, the computed mean of fifty
+    # identical values could sit one ulp off the value itself, leaving every
+    # centred term the same tiny nonzero constant - and the ratio of those is
+    # (n-1)/n, reported as a 0.98 correlation in a series with no signal.
+    if min(series) == max(series):
+        return 0.0
+    mean = math.fsum(series) / len(series)
+    denominator = math.fsum((x - mean) ** 2 for x in series)
     if denominator <= 0.0:
         return 0.0
-    numerator = sum(
+    numerator = math.fsum(
         (series[i] - mean) * (series[i + 1] - mean) for i in range(len(series) - 1)
     )
     return numerator / denominator
