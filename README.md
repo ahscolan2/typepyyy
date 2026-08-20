@@ -7,7 +7,6 @@ writing sessions. The records are intended as training and evaluation data for
 academic-integrity research — for example, as inputs to detectors of
 machine-generated writing. TypeTrace can also replay a record into a real document
 editor, so we can study what those editors actually record of the writing process.
-Run replays only against documents and accounts you own or have explicit consent to use.
 
 On its own it writes data files; with the optional extras installed it can also
 type a record into a live editor — see **Replaying into a live editor** below.
@@ -77,11 +76,11 @@ python main.py --text @essay.txt --seed 42 --output record.json --emit docs --do
 ```
 
 Requires the playwright extra (see Install). The first run opens a visible browser
-window so you can log into your own Google account; the browser profile persists in
+window so you can log into a Google account; the browser profile persists in
 `.typetrace-browser-profile/`, so later runs reuse that login (`--headless` only makes
-sense once the profile exists — logging in needs the visible window). Use a blank
-test document: the document ID is the long string in its URL. Afterwards, inspect
-**Tools → Version history** in Google Docs to see what the editor recorded.
+sense once the profile exists — logging in needs the visible window). The document ID
+is the long string in the document's URL. Afterwards, inspect **Tools → Version
+history** in Google Docs to see what the editor recorded.
 
 ### Desktop (Word and other editors)
 
