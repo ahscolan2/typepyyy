@@ -5,13 +5,15 @@ A library of typing errors richer than the single neighbour-key substitution
 that macro_scripter implements: anticipations, perseverations, transpositions,
 stutters, and homophone confusions.
 
-NOTHING ELSE IN THIS PROJECT IMPORTS THIS MODULE. `python main.py` and the
-desktop app both run macro_scripter's own typo model and never call anything
-here. This module is an optional extra for experiments that want a wider error
-taxonomy - a caller who wants one imports it and drives it directly. It is not
-part of the default generator, and the docstrings here do not claim otherwise.
-Wiring it into MacroScripter would mean changing that class's script
-construction, which is deliberately out of scope.
+By default nothing runs this model: `python main.py` and the desktop app use
+macro_scripter's own neighbour-key typo model. Passing `--typo-model rich`
+switches the generator to the wider taxonomy: MacroScripter then draws error
+candidates from candidate_edits() and corrections from edit_correction_events()
+below, at typing time inside its own burst flow, spending the same --typo-rate
+budget. The import runs in that direction only - MacroScripter imports this
+module lazily when asked for the rich model, never at module level, because
+this module imports macro_scripter for the ScriptEvent vocabulary and a
+top-level import back the other way would be a cycle.
 
 It is written to compose with macro_scripter rather than to replace it. The
 scripts it emits are macro_scripter.ScriptEvent objects in the same op
@@ -117,6 +119,79 @@ def is_suffix_edit(original: str, flawed: str) -> bool:
     return original[-1] != flawed[-1]
 
 
+def candidate_edits(text: str, index: int) -> List[ErrorEdit]:
+    """Every cognitive error kind that is physically applicable at `index`.
+
+    A pure function of the text and position - no randomness - so a caller can
+    inspect what is possible before deciding whether anything happens. This is
+    the shared core behind CognitiveErrorModel._candidates and MacroScripter's
+    rich typo model; keep the two in step by keeping them both here.
+    """
+    candidates: List[ErrorEdit] = []
+    char = text[index]
+    if not char.isalpha():
+        # Spaces and punctuation are not subject to these errors; a space is
+        # struck by the thumb and is not part of a letter sequence.
+        return candidates
+
+    following = text[index + 1] if index + 1 < len(text) else ""
+    if following.isalpha() and following != char:
+        candidates.append(
+            ErrorEdit(
+                KIND_EXCHANGE,
+                index,
+                text[index:index + 2],
+                following + char,
+            )
+        )
+
+    if char.lower() in STUTTER_KEYS:
+        candidates.append(ErrorEdit(KIND_STUTTER, index, char, char * 2))
+
+    for distance in ANTICIPATION_DISTANCES:
+        ahead = index + distance
+        if ahead < len(text) and text[ahead].isalpha() and text[ahead] != char:
+            candidates.append(
+                ErrorEdit(KIND_ANTICIPATION, index, char, text[ahead])
+            )
+
+    for distance in PERSEVERATION_DISTANCES:
+        behind = index - distance
+        if behind >= 0 and text[behind].isalpha() and text[behind] != char:
+            candidates.append(
+                ErrorEdit(KIND_PERSEVERATION, index, char, text[behind])
+            )
+
+    return candidates
+
+
+def edit_correction_events(
+    edit: ErrorEdit, reaction_pause_ms: float
+) -> List[ScriptEvent]:
+    """Type the error, notice it after `reaction_pause_ms`, backspace, retype.
+
+    The pause duration is a parameter rather than a draw so a caller with its
+    own Random - MacroScripter, whose whole script must reproduce from one
+    seed - keeps its stream to itself. CognitiveErrorModel.correction_events
+    wraps this with a draw from the model's own Random.
+    """
+    events: List[ScriptEvent] = [
+        ScriptEvent(ms.OP_TYPE, char=ch, role=ms.ROLE_TYPO)
+        for ch in edit.typed
+    ]
+    events.append(
+        ScriptEvent(ms.OP_PAUSE, duration_ms=reaction_pause_ms, role=ms.ROLE_TYPO)
+    )
+    events.append(
+        ScriptEvent(ms.OP_DELETE, count=len(edit.typed), role=ms.ROLE_CORRECTION)
+    )
+    events.extend(
+        ScriptEvent(ms.OP_TYPE, char=ch, role=ms.ROLE_CORRECTION)
+        for ch in edit.intended
+    )
+    return events
+
+
 class CognitiveErrorModel:
     """Introduces cognitive typing errors and the scripts that correct them.
 
@@ -143,44 +218,10 @@ class CognitiveErrorModel:
         Only applicable kinds are offered. The previous version of this module
         chose a kind first and then silently returned the text unchanged when
         that kind did not fit, which made the achieved error rate unrelated to
-        the configured one.
+        the configured one. The logic lives in the module-level candidate_edits
+        so MacroScripter's rich typo model shares it.
         """
-        candidates: List[ErrorEdit] = []
-        char = text[index]
-        if not char.isalpha():
-            # Spaces and punctuation are not subject to these errors; a space is
-            # struck by the thumb and is not part of a letter sequence.
-            return candidates
-
-        following = text[index + 1] if index + 1 < len(text) else ""
-        if following.isalpha() and following != char:
-            candidates.append(
-                ErrorEdit(
-                    KIND_EXCHANGE,
-                    index,
-                    text[index:index + 2],
-                    following + char,
-                )
-            )
-
-        if char.lower() in STUTTER_KEYS:
-            candidates.append(ErrorEdit(KIND_STUTTER, index, char, char * 2))
-
-        for distance in ANTICIPATION_DISTANCES:
-            ahead = index + distance
-            if ahead < len(text) and text[ahead].isalpha() and text[ahead] != char:
-                candidates.append(
-                    ErrorEdit(KIND_ANTICIPATION, index, char, text[ahead])
-                )
-
-        for distance in PERSEVERATION_DISTANCES:
-            behind = index - distance
-            if behind >= 0 and text[behind].isalpha() and text[behind] != char:
-                candidates.append(
-                    ErrorEdit(KIND_PERSEVERATION, index, char, text[behind])
-                )
-
-        return candidates
+        return candidate_edits(text, index)
 
     def plan_errors(self, text: str) -> List[ErrorEdit]:
         """Decide where errors happen, without changing the text.
@@ -255,21 +296,13 @@ class CognitiveErrorModel:
 
         The error is fixed immediately, before typing continues past it, which
         is what keeps the deletion at the end of the buffer where a backspace
-        can reach it.
+        can reach it. The event construction lives in the module-level
+        edit_correction_events; this wrapper only draws the reaction pause
+        from the model's own Random.
         """
-        events: List[ScriptEvent] = [
-            ScriptEvent(ms.OP_TYPE, char=ch, role=ms.ROLE_TYPO)
-            for ch in edit.typed
-        ]
-        events.append(self._reaction_pause(ms.ROLE_TYPO))
-        events.append(
-            ScriptEvent(ms.OP_DELETE, count=len(edit.typed), role=ms.ROLE_CORRECTION)
+        return edit_correction_events(
+            edit, self._rng.uniform(*ms.TYPO_REACTION_RANGE)
         )
-        events.extend(
-            ScriptEvent(ms.OP_TYPE, char=ch, role=ms.ROLE_CORRECTION)
-            for ch in edit.intended
-        )
-        return events
 
     def generate_correction_script(
         self, original: str, flawed: str
