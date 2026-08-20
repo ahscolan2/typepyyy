@@ -1,4 +1,4 @@
-# Project TypeTrace
+# Typepyyy
 
 TypeTrace generates synthetic writing-process data: keystroke-level records of how a
 piece of text could plausibly have been typed, including inter-key intervals, key
