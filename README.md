@@ -357,43 +357,6 @@ draws are clamped to the cap. Session gaps are drawn from a table that already
 sits under that ceiling, so the clamp guards the rule rather than setting the
 value.
 
-## What this does not model
-
-The model is a good account of *micro-timing* and a partial account of
-*composition*. Anyone using these records as training or evaluation data should
-know where the two come apart.
-
-- **Text is produced linearly from the finished document.** The generator is
-  given the final text and types it. Real writing produces material that is
-  written, discarded, and never appears in the finished piece. Nothing here
-  does that.
-- **Revisions retype identical characters.** Both revision mechanisms delete a
-  span and retype exactly what was there, because that is what keeps the replay
-  invariant true by construction. Real revision changes the words. A deleted
-  span matching its replacement character for character is a strong signal, and
-  it is the mechanism that lifts the deletion ratio into the cited band.
-- **The editing model is backspace-only.** There is no cursor movement, no
-  mouse, no selection, no paste, no `ctrl`-backspace, no held-backspace
-  auto-repeat, no arrow keys, no insertion into earlier text, and no
-  interaction with autocorrect or spellcheck. Real keystroke logs are full of
-  all of these.
-- **Errors are single-character neighbour substitutions**, corrected
-  immediately, on letters only (uppercase included, case preserved; digits,
-  punctuation and whitespace are never mistyped) — no transpositions,
-  omissions, doubling, or errors noticed several characters later. `error_models.py` in
-  this repository implements a wider taxonomy (anticipations, perseverations,
-  exchanges, stutters, homophone confusions), but it is a standalone library:
-  nothing in the CLI, GUI or pipeline imports it, and its own docstring says
-  so. Records produced by `main.py` never contain those error kinds.
-- **US-QWERTY English is the only well-modelled case.** Unmapped characters
-  fall back to a neutral digraph class, and there is no IME, dead-key or
-  alternate-layout behaviour.
-- **A detector trained only on this data learns this model.** The parameters
-  are a small fixed set with published sources for some and stated model
-  choices for the rest; a classifier can learn that signature rather than
-  learning what human writing looks like. Treat these records as a controlled
-  negative or as augmentation, not as a substitute for real keystroke logs.
-
 ## Testing
 
 ```bash
