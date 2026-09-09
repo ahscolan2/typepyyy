@@ -1,22 +1,17 @@
-"""
-Project TypeTrace - Command line interface.
+"""Generate synthetic writing-process records from text.
 
-Generates synthetic writing-process datasets: keystroke-level records of how a
-piece of text could plausibly have been typed, for training and evaluating
-detectors of machine-generated writing.
-
-This tool writes data files. Optionally (--emit) it can also replay a finished
-record into a real document editor owned by the user - a Google Doc in the
-user's own browser profile, or the focused desktop window - so researchers can
-study what those editors record. That replay is an optional extra with its own
-dependencies (playwright or pynput); the generator itself needs only numpy.
+The optional ``--emit`` flag replays a record into Google Docs or a focused
+desktop editor. Those integrations load their dependencies only when used.
 """
 
 import argparse
 import json
+import math
+import os
 import sys
+import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import macro_scripter as ms
 import replay
@@ -44,7 +39,7 @@ def load_text(text_arg: str) -> str:
     if text_arg.startswith("@"):
         path = Path(text_arg[1:])
         try:
-            return path.read_text(encoding="utf-8")
+            return path.read_text(encoding="utf-8-sig")
         except FileNotFoundError:
             raise FileNotFoundError(f"text file not found: {path}") from None
         except UnicodeDecodeError as exc:
@@ -97,6 +92,36 @@ def render_record(record: dict, output_format: str) -> str:
     raise ValueError(f"unknown output format {output_format!r}")
 
 
+def write_output(path: Path, payload: str, *, overwrite: bool = False) -> None:
+    """Write UTF-8 output without truncating an existing file on failure."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(payload)
+        if overwrite:
+            os.replace(temporary, path)
+        else:
+            # Windows rename refuses an existing destination and also works
+            # on FAT/exFAT drives. POSIX rename replaces, so use a hard link
+            # there to publish without a check-then-write race.
+            try:
+                publish = os.rename if os.name == "nt" else os.link
+                publish(temporary, path)
+            except FileExistsError:
+                raise FileExistsError(
+                    f"{path} already exists; pass --force to overwrite"
+                ) from None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def _positive_float(value: str) -> float:
     """An argparse type for a strictly positive number.
 
@@ -109,8 +134,8 @@ def _positive_float(value: str) -> float:
         number = float(value)
     except ValueError:
         raise argparse.ArgumentTypeError(f"expected a number, got {value!r}")
-    if not number > 0.0 or number != number:
-        raise argparse.ArgumentTypeError(f"must be greater than 0, got {value}")
+    if not math.isfinite(number) or number <= 0.0:
+        raise argparse.ArgumentTypeError(f"must be finite and greater than 0, got {value}")
     return number
 
 
@@ -119,8 +144,8 @@ def _non_negative_float(value: str) -> float:
         number = float(value)
     except ValueError:
         raise argparse.ArgumentTypeError(f"expected a number, got {value!r}")
-    if number < 0.0 or number != number:
-        raise argparse.ArgumentTypeError(f"must be 0 or greater, got {value}")
+    if not math.isfinite(number) or number < 0.0:
+        raise argparse.ArgumentTypeError(f"must be finite and 0 or greater, got {value}")
     return number
 
 
@@ -254,7 +279,7 @@ Examples:
     )
     parser.add_argument(
         "--doc-id", default=None,
-        help="Google Docs document ID; required with --emit docs",
+        help="Google Docs document URL or ID; required with --emit docs",
     )
     parser.add_argument(
         "--emit-speed", type=_positive_float, default=1.0,
@@ -282,10 +307,23 @@ Examples:
             ".typetrace-browser-profile)"
         ),
     )
+    parser.add_argument(
+        "--browser-channel", choices=["chromium", "chrome", "msedge"],
+        default="chromium",
+        help="Browser for --emit docs (default: Playwright's chromium)",
+    )
+    parser.add_argument(
+        "--editor-timeout-s", type=_positive_float, default=300.0,
+        help="Seconds to allow for sign-in and editor readiness (default: 300)",
+    )
     return parser
 
 
-def emit_record(record: dict, args: argparse.Namespace) -> dict:
+def emit_record(
+    record: dict, args: argparse.Namespace, *,
+    should_abort: Optional[Callable[[], bool]] = None,
+    on_status: Optional[Callable[[str], None]] = None,
+) -> dict:
     """Replay `record` into a live editor, per the --emit CLI options.
 
     The emitters and their dependencies (playwright for Google Docs, pynput
@@ -293,8 +331,13 @@ def emit_record(record: dict, args: argparse.Namespace) -> dict:
     emission was actually requested. A missing dependency comes back as an
     ImportError telling the user what to pip install.
     """
+    callbacks = {}
+    if should_abort is not None:
+        callbacks["should_abort"] = should_abort
+    if on_status is not None:
+        callbacks["on_status"] = on_status
     if args.emit == "docs":
-        if not args.doc_id:
+        if not args.doc_id or not args.doc_id.strip():
             raise ValueError("--doc-id is required with --emit docs")
         import docs_emitter
 
@@ -305,13 +348,19 @@ def emit_record(record: dict, args: argparse.Namespace) -> dict:
             max_gap_s=args.emit_max_gap_s,
             headless=args.headless,
             profile_dir=args.browser_profile,
+            browser_channel=getattr(args, "browser_channel", "chromium"),
+            editor_timeout_s=getattr(args, "editor_timeout_s", 300.0),
+            **callbacks,
         )
+    if args.emit != "desktop":
+        raise ValueError(f"unknown emission target {args.emit!r}")
     import desktop_emitter
 
     return desktop_emitter.emit_to_desktop(
         record,
         speed=args.emit_speed,
         max_gap_s=args.emit_max_gap_s,
+        **callbacks,
     )
 
 
@@ -332,8 +381,13 @@ def main(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
 
     try:
-        if args.emit == "docs" and not args.doc_id:
+        if args.emit == "docs" and (not args.doc_id or not args.doc_id.strip()):
             raise ValueError("--doc-id is required with --emit docs")
+
+        if args.output and Path(args.output).exists() and not args.force:
+            raise FileExistsError(
+                f"{args.output} already exists; pass --force to overwrite"
+            )
 
         text = load_text(args.text)
 
@@ -359,12 +413,7 @@ def main(argv: Optional[list] = None) -> int:
 
         if args.output:
             out_path = Path(args.output)
-            if out_path.exists() and not args.force:
-                raise FileExistsError(
-                    f"{out_path} already exists; pass --force to overwrite"
-                )
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(payload, encoding="utf-8")
+            write_output(out_path, payload, overwrite=args.force)
             print(f"Wrote {out_path}", file=sys.stderr)
         else:
             sys.stdout.write(payload)
@@ -384,10 +433,12 @@ def main(argv: Optional[list] = None) -> int:
         if args.emit:
             summary = emit_record(record, args)
             print(f"emission: {summary}", file=sys.stderr)
+            if summary.get("aborted"):
+                return 130
 
     except (
         FileNotFoundError, FileExistsError, ValueError, TypeError, OSError,
-        ImportError,
+        ImportError, RuntimeError,
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

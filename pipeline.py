@@ -24,6 +24,7 @@ from typing import List, Optional
 
 import macro_scripter as ms
 import timing_engine as te
+from emit_common import physical_key
 from macro_scripter import MacroScripter, ScriptEvent
 from timing_engine import BACKSPACE, TimingEngine
 
@@ -96,7 +97,13 @@ class Timeline:
 
     @property
     def total_time_ms(self) -> float:
-        return self.events[-1].keyup_ms if self.events else 0.0
+        return max(
+            max((event.keyup_ms for event in self.events), default=0.0),
+            max(
+                (interval.start_ms + interval.duration_ms for interval in self.intervals),
+                default=0.0,
+            ),
+        )
 
     @property
     def session_gap_ms(self) -> float:
@@ -128,6 +135,7 @@ def script_key_sequence(script: List[ScriptEvent]) -> List[str]:
     """
     keys: List[str] = []
     for event in script:
+        ms.validate_script_event(event)
         if event.op == ms.OP_TYPE:
             keys.append(event.char)
         elif event.op == ms.OP_DELETE:
@@ -138,142 +146,83 @@ def script_key_sequence(script: List[ScriptEvent]) -> List[str]:
 def build_timeline(
     script: List[ScriptEvent], engine: TimingEngine
 ) -> Timeline:
-    """Walk the script, assigning every operation a place on one clock."""
-    # The engine's burstiness solve depends on the digraph mix of the text, so
-    # let it measure the real sequence before it starts emitting.
+    """Place keys and silences on one clock, including leading/trailing waits."""
     engine.calibrate(script_key_sequence(script))
-
     timeline = Timeline()
-
-    # Time of the most recent keydown. The first keystroke is placed relative
-    # to zero rather than to a previous key.
     last_keydown: Optional[float] = None
-    # Total silence owed to the clock before the next keystroke lands, and the
-    # part of it that is thinking pause rather than session gap. A gap already
-    # has its own interval, so folding it into the pause total as well would
-    # record the same silence twice - once as a gap and once as a phantom
-    # fifteen-minute pause at the same start_ms.
+    last_release_ms = 0.0
     pending_delay_ms = 0.0
-    pending_pause_ms = 0.0
-    pause_start_ms: Optional[float] = None
-    # Set when a session gap has just been emitted, so the keystroke that
-    # resumes writing is marked as having no motor predecessor. Its interval
-    # spans the break and carries none of the rhythm the engine models.
     resuming_after_gap = False
+    held_by_key = {}
 
     for event in script:
-        if event.op == ms.OP_PAUSE:
-            if pause_start_ms is None:
-                anchor = timeline.events[-1].keyup_ms if timeline.events else 0.0
-                pause_start_ms = anchor + pending_delay_ms
-            pending_pause_ms += event.duration_ms
-            pending_delay_ms += event.duration_ms
-            continue
-
-        if event.op == ms.OP_SESSION_GAP:
-            # A pause accumulated before the gap is flushed here, at its own
-            # anchor, rather than left pending. Held over, the next keystroke
-            # would merge it with any pause after the gap into one interval
-            # anchored before the gap - a span overlapping the gap itself.
-            if pending_pause_ms > 0.0 and timeline.events:
+        if event.op in (ms.OP_PAUSE, ms.OP_SESSION_GAP):
+            if event.duration_ms > 0.0:
                 timeline.intervals.append(
                     Interval(
-                        kind="pause",
-                        start_ms=(
-                            pause_start_ms
-                            if pause_start_ms is not None
-                            else timeline.events[-1].keyup_ms
-                        ),
-                        duration_ms=pending_pause_ms,
+                        kind="pause" if event.op == ms.OP_PAUSE else "session_gap",
+                        start_ms=last_release_ms + pending_delay_ms,
+                        duration_ms=event.duration_ms,
                         role=event.role,
                     )
                 )
-            pending_pause_ms = 0.0
-            pause_start_ms = None
-
-            start = last_keydown if last_keydown is not None else 0.0
-            start = timeline.events[-1].keyup_ms if timeline.events else start
-            timeline.intervals.append(
-                Interval(
-                    kind="session_gap",
-                    start_ms=start + pending_delay_ms,
-                    duration_ms=event.duration_ms,
-                    role=event.role,
-                )
-            )
-            # The gap moves the clock but is not a pause; only pending_delay_ms
-            # takes it.
-            pending_delay_ms += event.duration_ms
-            # Coming back to the document after a break, neither the previous
-            # keystroke nor the previous typing speed carries over.
-            engine.reset_context()
-            engine.reset_speed()
-            resuming_after_gap = True
+                pending_delay_ms += event.duration_ms
+            if event.op == ms.OP_SESSION_GAP:
+                engine.reset_context()
+                engine.reset_speed()
+                resuming_after_gap = True
             continue
 
-        # The kind of keystroke comes from the operation, never from the
-        # character. Inferring it from the character would misread a literal
-        # backspace (U+0008) in the input text as a delete, and reconstruction
-        # would then eat the character before it.
         if event.op == ms.OP_TYPE:
-            actions = [(event.char, event.role, KIND_KEY)]
-        elif event.op == ms.OP_DELETE:
-            actions = [(BACKSPACE, event.role, KIND_BACKSPACE)] * event.count
-        else:
-            raise ValueError(f"unknown script op {event.op!r}")
+            actions = [(event.char, KIND_KEY)]
+        else:  # DELETE; script_key_sequence has validated every operation.
+            actions = [(BACKSPACE, KIND_BACKSPACE)] * event.count
 
-        for char, role, kind in actions:
+        for char, kind in actions:
             timing = engine.next_keystroke(char)
-
-            if pending_pause_ms > 0.0 and timeline.events:
-                timeline.intervals.append(
-                    Interval(
-                        kind="pause",
-                        start_ms=(
-                            pause_start_ms
-                            if pause_start_ms is not None
-                            else timeline.events[-1].keyup_ms
-                        ),
-                        duration_ms=pending_pause_ms,
-                        role=role,
-                    )
-                )
-
+            followed_silence = pending_delay_ms > 0.0
             if last_keydown is None:
                 keydown = pending_delay_ms
                 iki = 0.0
             else:
-                keydown = last_keydown + pending_delay_ms + timing.iki_ms
-                iki = pending_delay_ms + timing.iki_ms
-            # Whether any silence separated this keystroke from the previous
-            # one, which the rollover test below needs after the counters reset.
-            followed_silence = pending_delay_ms > 0.0
+                keydown = last_keydown + timing.iki_ms
+                if followed_silence:
+                    # Silence starts only after every held key is released.
+                    # Retain the motor interval and add the entire silence;
+                    # a fast motor sample must not resume inside the pause.
+                    keydown = max(keydown, last_release_ms) + pending_delay_ms
+                # Avoid subtractive rounding making the full interval a few
+                # ulps smaller than its unchanged motor component.
+                iki = max(timing.iki_ms, keydown - last_keydown)
             pending_delay_ms = 0.0
-            pending_pause_ms = 0.0
-            pause_start_ms = None
 
-            # Rollover: the previous key is released after this one goes down.
-            # The engine decides this from the motor interval alone, which is
-            # all it knows about. A deliberate pause or a session gap lives out
-            # here, so if one intervened the previous key was let go long
-            # before this one was struck - extending it to this keydown would
-            # hold it for the whole silence and produce dwells of seconds
-            # against a model that says 116 ms.
             if (
                 timing.prev_overlap_ms > 0.0
                 and not followed_silence
                 and timeline.events
             ):
                 previous = timeline.events[-1]
-                extended = keydown + timing.prev_overlap_ms
-                if extended > previous.keyup_ms:
-                    previous.keyup_ms = extended
-                    previous.dwell_ms = previous.keyup_ms - previous.keydown_ms
+                previous.keyup_ms = max(
+                    previous.keyup_ms, keydown + timing.prev_overlap_ms
+                )
+                previous.dwell_ms = previous.keyup_ms - previous.keydown_ms
+                last_release_ms = max(last_release_ms, previous.keyup_ms)
+
+            # One physical key cannot overlap its next press, including
+            # shifted forms and nonadjacent repeats during long dwells.
+            identity = physical_key(char)
+            held_by_key = {
+                key: held for key, held in held_by_key.items()
+                if held.keyup_ms > keydown
+            }
+            previous_same_key = held_by_key.get(identity)
+            if previous_same_key is not None:
+                previous_same_key.keyup_ms = keydown
+                previous_same_key.dwell_ms = keydown - previous_same_key.keydown_ms
 
             flight = (
                 keydown - timeline.events[-1].keyup_ms if timeline.events else 0.0
             )
-
             timeline.events.append(
                 KeyEvent(
                     index=len(timeline.events),
@@ -289,19 +238,18 @@ def build_timeline(
                         else timing.iki_ms
                     ),
                     flight_ms=flight,
-                    role=role,
+                    role=event.role,
                 )
             )
             last_keydown = keydown
+            held_by_key[identity] = timeline.events[-1]
+            last_release_ms = max(held.keyup_ms for held in held_by_key.values())
             resuming_after_gap = False
 
-    # A session gap is recorded when its op is seen, but a pause is held back
-    # and recorded when the keystroke that ends it lands. A script with a
-    # PAUSE directly before a SESSION_GAP therefore appends them out of order.
-    # The generator does not currently emit that sequence, but build_timeline
-    # takes any script, and "intervals is in time order" is the contract a
-    # consumer will assume.
-    timeline.intervals.sort(key=lambda interval: interval.start_ms)
+    # A nonadjacent repeat can shorten an earlier dwell after its immediate
+    # successor was added. Derive flights from the final release times.
+    for previous, current in zip(timeline.events, timeline.events[1:]):
+        current.flight_ms = current.keydown_ms - previous.keyup_ms
     return timeline
 
 

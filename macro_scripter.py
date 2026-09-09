@@ -13,6 +13,7 @@ Based on Chenoweth & Hayes (P-bursts and R-bursts) and Leijten & Van Waes
 (revision behaviour).
 """
 
+import math
 import random
 import unicodedata
 from dataclasses import dataclass
@@ -199,6 +200,30 @@ class ScriptEvent:
         return d
 
 
+def validate_script_event(event: ScriptEvent) -> None:
+    """Reject malformed operations before replay or timing changes any state."""
+    if event.op == OP_TYPE:
+        if event.char is None:
+            raise ValueError("TYPE event has no char")
+        if not isinstance(event.char, str) or len(event.char) != 1:
+            raise ValueError("TYPE char must be exactly one Unicode code point")
+    elif event.op == OP_DELETE:
+        if isinstance(event.count, bool) or not isinstance(event.count, int):
+            raise ValueError("DELETE count must be an integer")
+        if event.count < 0:
+            raise ValueError(f"DELETE count must be >= 0, got {event.count}")
+    elif event.op in (OP_PAUSE, OP_SESSION_GAP):
+        if (
+            isinstance(event.duration_ms, bool)
+            or not isinstance(event.duration_ms, (int, float))
+            or not math.isfinite(event.duration_ms)
+            or event.duration_ms < 0
+        ):
+            raise ValueError(f"{event.op} duration_ms must be finite and >= 0")
+    else:
+        raise ValueError(f"unknown script op {event.op!r}")
+
+
 def replay(events: List[ScriptEvent]) -> str:
     """Apply the script to an empty buffer and return the resulting text.
 
@@ -207,13 +232,10 @@ def replay(events: List[ScriptEvent]) -> str:
     """
     buffer: List[str] = []
     for event in events:
+        validate_script_event(event)
         if event.op == OP_TYPE:
-            if event.char is None:
-                raise ValueError("TYPE event has no char")
             buffer.append(event.char)
         elif event.op == OP_DELETE:
-            if event.count < 0:
-                raise ValueError(f"DELETE count must be >= 0, got {event.count}")
             if event.count > len(buffer):
                 raise ValueError(
                     f"DELETE of {event.count} exceeds buffer length {len(buffer)}"
@@ -282,8 +304,14 @@ class MacroScripter:
                 "structural_revision_rate must be in [0, 1], got "
                 f"{structural_revision_rate}"
             )
-        if session_chars is not None and session_chars <= 0:
-            raise ValueError(f"session_chars must be positive, got {session_chars}")
+        if session_chars is not None and (
+            isinstance(session_chars, bool)
+            or not isinstance(session_chars, int)
+            or session_chars <= 0
+        ):
+            raise ValueError(
+                f"session_chars must be a positive integer, got {session_chars}"
+            )
 
         self._rng = random.Random(seed)
         self.typo_rate = typo_rate
@@ -412,6 +440,9 @@ class MacroScripter:
 
         Guarantees `replay(result) == text`.
         """
+        if not isinstance(text, str):
+            raise TypeError(f"text must be str, got {type(text).__name__}")
+        self.error_kinds.clear()
         events: List[ScriptEvent] = []
         if not text:
             return events
@@ -438,13 +469,12 @@ class MacroScripter:
         sentence_starts: List[int] = []
         sentence_opens = True
 
-        for index, token in enumerate(tokens):
+        for token in tokens:
             is_whitespace = token.isspace()
 
-            # A session gap goes at a token boundary, never mid-word, and never
-            # after the final token (nobody stops writing then comes back to
-            # type nothing).
-            if chars_this_session >= session_limit and index < len(tokens) - 1:
+            # Check before typing the token, including the final one. A gap
+            # therefore always has work after it and never splits a word.
+            if chars_this_session >= session_limit:
                 events.append(
                     ScriptEvent(
                         OP_SESSION_GAP,

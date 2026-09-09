@@ -22,7 +22,7 @@ TEXT = "Academic integrity matters.\nSecond line."
 
 CLI_EMIT_KEYS = (
     "emit", "doc_id", "emit_speed", "emit_max_gap_s", "headless",
-    "browser_profile",
+    "browser_profile", "browser_channel", "editor_timeout_s",
 )
 
 
@@ -78,7 +78,7 @@ def pump(app, timeout=15.0):
     """Run the event loop until the worker's record has been drained."""
     root = app.winfo_toplevel()
     deadline = time.monotonic() + timeout
-    while app._record is None and time.monotonic() < deadline:
+    while app._busy and time.monotonic() < deadline:
         root.update()
         time.sleep(0.01)
     return app._record
@@ -265,6 +265,7 @@ def test_emit_namespace_matches_the_cli_parser_shape():
         "-t", "x", "--emit", "docs", "--doc-id", "abc123",
         "--emit-speed", "2.0", "--emit-max-gap-s", "0.5", "--headless",
         "--browser-profile", "some-profile",
+        "--browser-channel", "chrome",
     ])
     assert vars(ns) == {key: getattr(cli, key) for key in CLI_EMIT_KEYS}
 
@@ -296,9 +297,9 @@ def test_collect_emit_options_rejects_bad_values(patch, fragment):
         gui.collect_emit_options(raw)
 
 
-def test_browser_profile_default_matches_the_cli():
-    args = main.build_parser().parse_args(["-t", "x"])
-    assert gui.DEFAULT_BROWSER_PROFILE == args.browser_profile
+def test_browser_profile_default_is_writable_user_storage():
+    from presets import get_default_browser_profile_dir
+    assert gui.DEFAULT_BROWSER_PROFILE == str(get_default_browser_profile_dir())
 
 
 # --- emitter availability ------------------------------------------------------
@@ -350,6 +351,7 @@ def test_a_bad_parameter_shows_a_dialog_and_does_not_start_work(app, dialogs):
 def test_emitting_without_a_doc_id_shows_a_dialog(app, dialogs):
     app.set_emit_support({"docs": (True, ""), "desktop": (True, "")})
     app.emit_enabled.set(True)
+    app.emit_target.set("docs")
     app._generate()
     assert [kind for kind, *_ in dialogs] == ["showerror"]
     assert "Doc ID" in dialogs[0][1][1]
@@ -420,3 +422,139 @@ def test_generation_through_the_window_matches_the_cli(app, dialogs):
     assert app._record["target_text"] == gui.DEFAULT_TEXT
     assert len(app.output.get("1.0", "end").strip()) > 0
     assert str(app.save_button.cget("state")) == "normal"
+
+
+def test_gui_stop_button_signals_abort_and_disables_itself(app):
+    app._stop_requested.clear()
+    app.stop_button.configure(state="normal")
+    app._stop()
+    assert app._stop_requested.is_set() is True
+    assert str(app.stop_button.cget("state")) == "disabled"
+    assert app.status.get() == "Stopping replay…"
+
+
+def test_gui_replay_preserves_record_and_enables_save_on_abort(app, monkeypatch):
+    def fake_emit(record, emit_ns, should_abort=None, on_status=None):
+        if on_status:
+            on_status("Dispatching test keystrokes…")
+        return {
+            "emitter": "desktop",
+            "dispatched": 12,
+            "aborted": True,
+            "duration_s": 0.4,
+        }
+
+    monkeypatch.setattr(gui, "emit_record", fake_emit)
+    app.set_emit_support({"docs": (True, ""), "desktop": (True, "")})
+    app.emit_enabled.set(True)
+    app.emit_target.set("desktop")
+    app._update_emit_state()
+    app.rows["seed"].variable.set("5")
+
+    app._generate()
+    pump(app)
+
+    assert app._busy is False
+    assert app._record is not None
+    assert app._record["target_text"] == gui.DEFAULT_TEXT
+    assert str(app.save_button.cget("state")) == "normal"
+    assert str(app.stop_button.cget("state")) == "disabled"
+    assert str(app.generate_button.cget("state")) == "normal"
+    assert "Replay stopped. Record available to save." in app.status.get()
+    assert "Dispatching test keystrokes…" in app.log.get("1.0", "end")
+    assert len(app.output.get("1.0", "end").strip()) > 0
+
+
+def test_gui_replay_preserves_record_and_shows_dialog_on_emission_error(
+    app, dialogs, monkeypatch
+):
+    def fake_emit_fail(record, emit_ns, should_abort=None, on_status=None):
+        if on_status:
+            on_status("Connecting to target editor…")
+        raise RuntimeError("simulated editor connection failure")
+
+    monkeypatch.setattr(gui, "emit_record", fake_emit_fail)
+    app.set_emit_support({"docs": (True, ""), "desktop": (True, "")})
+    app.emit_enabled.set(True)
+    app.emit_target.set("desktop")
+    app._update_emit_state()
+    app.rows["seed"].variable.set("6")
+
+    app._generate()
+    pump(app)
+
+    assert app._busy is False
+    assert app._record is not None
+    assert app._record["target_text"] == gui.DEFAULT_TEXT
+    assert str(app.save_button.cget("state")) == "normal"
+    assert str(app.stop_button.cget("state")) == "disabled"
+    assert str(app.generate_button.cget("state")) == "normal"
+
+    assert len(dialogs) == 1
+    kind, args, _ = dialogs[0]
+    assert kind == "showerror"
+    assert args[0] == "Replay failed"
+    assert "simulated editor connection failure" in args[1]
+    assert "The generated record is still available to save." in args[1]
+
+    assert "Replay failed. The generated record is still available to save." in app.status.get()
+    assert len(app.output.get("1.0", "end").strip()) > 0
+
+
+def test_gui_replay_completion_updates_status_and_enables_save(app, monkeypatch):
+    def fake_emit_success(record, emit_ns, should_abort=None, on_status=None):
+        return {
+            "emitter": "desktop",
+            "dispatched": 40,
+            "aborted": False,
+            "duration_s": 1.0,
+        }
+
+    monkeypatch.setattr(gui, "emit_record", fake_emit_success)
+    app.set_emit_support({"docs": (True, ""), "desktop": (True, "")})
+    app.emit_enabled.set(True)
+    app.emit_target.set("desktop")
+    app._update_emit_state()
+    app.rows["seed"].variable.set("7")
+
+    app._generate()
+    pump(app)
+
+    assert app._busy is False
+    assert app._record is not None
+    assert "Replay complete. Record available to save." in app.status.get()
+    assert str(app.save_button.cget("state")) == "normal"
+    assert str(app.stop_button.cget("state")) == "disabled"
+    assert str(app.generate_button.cget("state")) == "normal"
+
+
+def test_gui_close_sets_stop_event(app, monkeypatch):
+    # Keep the shared Tk interpreter alive for fixture teardown.
+    monkeypatch.setattr(app.winfo_toplevel(), "destroy", lambda: None)
+    app._stop_requested.clear()
+    app.close()
+    assert app._stop_requested.is_set() is True
+
+
+def test_setup_applies_live_settings_without_replacing_text(app):
+    app.text_input.delete("1.0", "end")
+    app.text_input.insert("1.0", "My own paragraph.")
+    app.setup.set("Confirmed Google Docs")
+    app._apply_setup()
+    assert app._current_text() == "My own paragraph."
+    options = gui.collect_emit_options(app._raw_emit_options())
+    assert options.emit == "desktop"
+    assert options.emit_speed == 2.5
+    assert app.rows["seed"].variable.get() == "23"
+    assert "type" in app.generate_button.cget("text")
+    app.setup.set("Preview only")
+    app._apply_setup()
+    assert gui.collect_emit_options(app._raw_emit_options()) is None
+
+
+def test_setup_example_is_explicit(app):
+    app.setup.set("Quick editor check")
+    app._apply_setup()
+    assert app._current_text() == gui.DEFAULT_TEXT
+    app._use_example()
+    assert app._current_text().startswith("Hello Google Docs!")

@@ -116,6 +116,41 @@ def test_backspace_keystrokes_pass_through():
     assert all(ks["char"] is None for _, ks in backspace_events)
 
 
+@pytest.mark.parametrize("first,second,kind", [
+    ("a", "a", "key"), ("a", "A", "key"), ("!", "1", "key"),
+    (None, None, "backspace"),
+])
+def test_overlapping_physical_repeats_release_before_the_next_press(first, second, kind):
+    record = _record(
+        _keystroke(0, 0, 200, kind=kind, char=first),
+        _keystroke(1, 50, 100, char="b"),
+        _keystroke(2, 80, 150, kind=kind, char=second),
+    )
+    events = list(emit_common.iter_timeline(record))
+    assert [(event, ks["index"]) for _, event, ks in events] == [
+        ("down", 0), ("down", 1), ("up", 0), ("down", 2), ("up", 1), ("up", 2),
+    ]
+    assert [offset for offset, _, _ in events] == pytest.approx([0, .05, .08, .08, .1, .15])
+    assert record["keystrokes"][0]["keyup_ms"] == 200
+
+
+def test_repeat_normalization_happens_before_silence_capping():
+    record = _record(
+        _keystroke(0, 0, 2000, char="a"),
+        _keystroke(1, 100, 200, char="A"),
+        _keystroke(2, 1000, 1100, char="b"),
+    )
+    events = list(emit_common.iter_timeline(record, max_gap_s=.1))
+    assert [offset for offset, _, _ in events] == pytest.approx([0, .1, .1, .2, .3, .4])
+
+
+def test_zero_dwell_repeated_keys_each_press_and_release_in_record_order():
+    record = _record(*[_keystroke(i, 0, 0) for i in range(3)])
+    assert [(event, ks["index"]) for _, event, ks in emit_common.iter_timeline(record)] == [
+        ("down", 0), ("up", 0), ("down", 1), ("up", 1), ("down", 2), ("up", 2),
+    ]
+
+
 # --- run_timeline ------------------------------------------------------------
 
 
@@ -150,3 +185,21 @@ def test_run_timeline_should_abort_stops_early():
     )
     assert result["dispatched"] == 2
     assert result["aborted"] is True
+
+
+def test_backend_cancellation_preserves_completed_dispatch_count():
+    def dispatch(event, key):
+        if event == "up":
+            raise emit_common.ReplayCancelled()
+
+    events = emit_common.iter_timeline(_record(_keystroke(0, 0, 0)))
+    assert emit_common.run_timeline(events, dispatch)["dispatched"] == 1
+
+
+def test_ctrl_c_during_the_initial_abort_check_returns_an_aborted_clock():
+    def interrupt():
+        raise KeyboardInterrupt()
+
+    clock = emit_common.run_timeline([], lambda *_: None, should_abort=interrupt)
+    assert clock["aborted"] is True
+    assert clock["dispatched"] == 0

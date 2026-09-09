@@ -180,3 +180,47 @@ def test_shift_presses_and_releases_stay_balanced(fake_pynput):
     )
     assert presses == releases > 0
     assert keyboard.shift_level == 0
+
+
+def test_repeat_releases_the_physical_key_before_pressing_its_shifted_form(fake_pynput):
+    record = {"keystrokes": [
+        _keystroke(0, "a", 0, 200), _keystroke(1, "A", 50, 100),
+    ]}
+    desktop_emitter.emit_to_desktop(record, speed=1000, initial_delay_s=0)
+    keyboard = fake_pynput.instances[0]
+    assert [(action, _typed_name(key)) for action, key in keyboard.events] == [
+        ("press", "a"), ("release", "a"), ("press", "shift"),
+        ("press", "a"), ("release", "shift"), ("release", "a"),
+    ]
+    assert keyboard.text == "aA"
+
+
+def test_countdown_ctrl_c_cleans_up_without_dispatching(fake_pynput, monkeypatch):
+    def interrupt(_delay):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(desktop_emitter.time, "sleep", interrupt)
+    result = desktop_emitter.emit_to_desktop({"keystrokes": [_keystroke(0, "a", 0, 100)]})
+    assert result["aborted"] is True
+    assert fake_pynput.instances[0].events == []
+
+
+def test_shift_release_failure_is_retried_during_cleanup(fake_pynput, monkeypatch):
+    original_release = fake_pynput.release
+    failed = False
+
+    def release(self, key):
+        nonlocal failed
+        if key == _FakeKey.shift and not failed:
+            failed = True
+            raise RuntimeError("Shift release failed")
+        original_release(self, key)
+
+    monkeypatch.setattr(fake_pynput, "release", release)
+    with pytest.raises(RuntimeError, match="Shift release failed"):
+        desktop_emitter.emit_to_desktop(
+            {"keystrokes": [_keystroke(0, "A", 0, 100)]}, initial_delay_s=0,
+        )
+    keyboard = fake_pynput.instances[0]
+    assert keyboard.shift_level == 0
+    assert ("release", "a") in [(action, _typed_name(key)) for action, key in keyboard.events]

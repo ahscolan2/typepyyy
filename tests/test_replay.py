@@ -9,7 +9,7 @@ replay says happened, the text printed at the bottom is the record's
 `target_text`, unchanged.
 
 The second is that it stays a table. The document column is fixed-width, so
-every character in it has to occupy one column and none of them may end the
+characters must be measured in terminal cells and none of them may end the
 line - a raw U+000B in the document would split the row in two and silently
 destroy the alignment of everything after it. `conftest` already carries such a
 text, because the generator is expected to handle them.
@@ -23,6 +23,7 @@ from functools import lru_cache
 from itertools import groupby
 
 import pytest
+from wcwidth import wcswidth
 
 import main
 import replay
@@ -117,8 +118,15 @@ def event_rows(rendered):
 def descriptions(rendered, width=WIDTH):
     """The EVENT column of every event row."""
     return [
-        row[DOCUMENT_START + width + 2:].strip() for row in event_rows(rendered)
+        document_fields(row)[2] for row in event_rows(rendered)
     ]
+
+
+def document_fields(row):
+    """Locate the actual cursor/padding/event boundary independently of width."""
+    match = re.fullmatch(r"(.*\|)( +)(\S.*)", row[DOCUMENT_START:])
+    assert match, row
+    return match.groups()
 
 
 def role_runs(record, role):
@@ -339,8 +347,52 @@ def test_control_characters_in_the_tail_are_shown_as_glyphs():
 @pytest.mark.parametrize("width", [0, 1, 8, WIDTH])
 def test_the_tail_never_exceeds_its_column_or_breaks_a_line(name, width):
     tail = visible_tail(EDGE_CASES[name], width)
-    assert len(tail) <= width + 2
+    assert wcswidth(tail) <= width + 2
     assert tail.splitlines() == [tail]
+
+
+@pytest.mark.parametrize("text,width,expected", [
+    ("A日本", 3, "…本|"),
+    ("Ae\u0301", 1, "…e\u0301|"),
+    ("A🙂", 1, "…|"),
+    ("A🙂", 2, "…🙂|"),
+    ("A👩\u200d💻", 2, "…👩\u200d💻|"),
+    ("A🇺🇸", 2, "…🇺🇸|"),
+    ("A👍🏽", 2, "…👍🏽|"),
+    ("A❤️", 2, "…❤️|"),
+    ("\u0301", 1, "◌\u0301|"),
+])
+def test_cell_truncation_preserves_whole_graphemes(text, width, expected):
+    assert visible_tail(text, width) == expected
+
+
+@pytest.mark.parametrize("width", [0, 1, 4, 8, 12])
+@pytest.mark.parametrize("full", [False, True])
+def test_mixed_ascii_cjk_combining_and_emoji_share_one_event_column(width, full):
+    text = "A日e\u0301🙂👩\u200d💻🇺🇸"
+    record = make_record(text, seed=17, typo_rate=0, r_burst_probability=0)
+    rendered = render(record, width=width, full=full)
+    rows = event_rows(rendered)
+    assert rows
+    for row in rows:
+        document, padding, _description = document_fields(row)
+        assert wcswidth(row[:DOCUMENT_START] + document + padding) == DOCUMENT_START + width + 3
+    if width == 12:
+        # Ten text cells, one cursor cell, then three field-padding spaces
+        # and one separator. Codepoint-based padding gives a different result.
+        assert rows[-1][DOCUMENT_START:].startswith(text + "|" + " " * 4)
+    assert rendered.endswith(text + "\n")
+
+
+def test_unicode_tail_snapshot_keeps_combining_bases_and_deletes_one_codepoint():
+    record = make_record("XXe\u0301", seed=1, typo_rate=0, r_burst_probability=0)
+    keys = record["keystrokes"]
+    deletion = dict(keys[-1], kind="backspace", char=None, role="correction",
+                    keydown_ms=keys[-1]["keyup_ms"] + 1)
+    record["keystrokes"] = keys + [deletion]
+    moments = replay._moments(record, NO_PAUSES_MS, width=1)
+    assert visible_tail(moments[-2]["text"], 1) == "…e\u0301|"
+    assert visible_tail(moments[-1]["text"], 1) == "…e|"
 
 
 # --- render: the header ------------------------------------------------------
@@ -563,7 +615,8 @@ def test_full_is_never_shorter_than_collapsed(fixture_name, request):
 
 def test_full_gives_every_keystroke_its_own_line(revision_record):
     rendered = render(revision_record, full=True)
-    assert len(event_rows(rendered)) == revision_record["statistics"]["keystrokes"]
+    keys = [description for description in descriptions(rendered) if not description.startswith("pause ")]
+    assert len(keys) == revision_record["statistics"]["keystrokes"]
 
 
 def test_full_folds_nothing(revision_record):
@@ -621,10 +674,9 @@ def test_the_document_column_never_wraps(name, width):
     for full in (False, True):
         rendered = render(record, full=full, width=width)
         for row in event_rows(rendered):
-            document = row[DOCUMENT_START:DOCUMENT_START + width + 2]
-            assert len(document) == width + 2, row
-            assert row[DOCUMENT_START + width + 2] == " ", row
-            assert row[DOCUMENT_START + width + 3] != " ", row
+            document, padding, description = document_fields(row)
+            assert wcswidth(document) + len(padding) == width + 3, row
+            assert description[0] != " ", row
 
 
 @pytest.mark.parametrize("width", [0, 1, 12, WIDTH, 200])
