@@ -22,10 +22,17 @@ the wall clock by emit_common.run_timeline, so Chrome receives each event
 "now" and stamps it itself.
 """
 
+import re
 import sys
-from typing import Any, Dict, List, Optional
+import time
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
+from urllib.parse import urlparse
 
-from emit_common import iter_timeline, run_timeline
+from emit_common import (
+    ReplayCancelled, SHIFTED_TO_BASE, finite_number, iter_timeline,
+    run_timeline, validate_live_text,
+)
 
 DOCS_EDIT_URL = "https://docs.google.com/document/d/{doc_id}/edit"
 
@@ -56,11 +63,7 @@ _SYMBOL_KEYS = {
 }
 
 # Shifted characters mapped to the unshifted character on the same key.
-_SHIFTED_CHARS = {
-    "~": "`", "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6",
-    "&": "7", "*": "8", "(": "9", ")": "0", "_": "-", "+": "=", "{": "[",
-    "}": "]", "|": "\\", ":": ";", '"': "'", "<": ",", ">": ".", "?": "/",
-}
+_SHIFTED_CHARS = SHIFTED_TO_BASE
 
 _SHIFT_DESCRIPTOR = {
     "code": "ShiftLeft",
@@ -104,6 +107,8 @@ def descriptor_for(char: str) -> Dict[str, Any]:
     "A" / "!" when shifted. Characters outside US QWERTY fall back to vk 0
     with the text carried by the char event alone.
     """
+    if not isinstance(char, str) or len(char) != 1:
+        raise ValueError("a browser key must contain exactly one character")
     if char in _NAMED_KEYS:
         return dict(_NAMED_KEYS[char])
 
@@ -113,12 +118,12 @@ def descriptor_for(char: str) -> Dict[str, Any]:
         base = _SHIFTED_CHARS[char]
         shift = True
 
-    if len(base) == 1 and "a" <= base.lower() <= "z":
+    if "a" <= base <= "z" or "A" <= base <= "Z":
         code = f"Key{base.upper()}"
         vk = ord(base.upper())
         if base.isupper():
             shift = True
-    elif len(base) == 1 and base.isdigit():
+    elif len(base) == 1 and "0" <= base <= "9":
         code = f"Digit{base}"
         vk = ord(base)
     elif base in _SYMBOL_KEYS:
@@ -202,6 +207,65 @@ def payloads_for(keystroke: Dict[str, Any], event: str) -> List[Dict[str, Any]]:
     return payloads
 
 
+def normalize_doc_id(value: str) -> str:
+    """Accept a document ID or a Google Docs editing URL."""
+    if not isinstance(value, str):
+        raise ValueError("doc_id must be a Google Docs URL or document ID")
+    value = value.strip()
+    if value.lower().startswith(("https://", "http://")):
+        parsed = urlparse(value)
+        match = re.fullmatch(r"/document/(?:u/\d+/)?d/([A-Za-z0-9_-]+)(?:/.*)?", parsed.path)
+        if parsed.scheme.lower() != "https" or parsed.netloc.lower() != "docs.google.com" or not match:
+            raise ValueError("expected an https://docs.google.com/document/d/... URL")
+        value = match[1]
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise ValueError("doc_id must be a Google Docs URL or document ID")
+    return value
+
+
+def replay_in_page(page, record, *, speed=1.0, max_gap_s=None, should_abort=None):
+    """Replay into an already focused Chromium editor, releasing keys on exit."""
+    events = list(iter_timeline(record, speed=speed, max_gap_s=max_gap_s))
+    validate_live_text(record)
+
+    def cancelled():
+        return page.is_closed() or (should_abort is not None and should_abort())
+
+    if cancelled():
+        return {"dispatched": 0, "aborted": True, "duration_s": 0.0}
+    cdp = page.context.new_cdp_session(page)
+    held = {}
+
+    def dispatch(event, key):
+        if event == "down":
+            held[id(key)] = key
+        try:
+            for payload in payloads_for(key, event):
+                if cancelled():
+                    raise ReplayCancelled()
+                cdp.send("Input.dispatchKeyEvent", payload)
+        except Exception as exc:
+            if cancelled():
+                raise ReplayCancelled() from exc
+            raise
+        if event == "up":
+            held.pop(id(key), None)
+
+    try:
+        return run_timeline(events, dispatch, should_abort=cancelled)
+    finally:
+        for key in held.values():
+            for payload in payloads_for(key, "up"):
+                try:
+                    cdp.send("Input.dispatchKeyEvent", payload)
+                except Exception:
+                    pass  # A failed character release must not skip Shift.
+        try:
+            cdp.detach()
+        except Exception:
+            pass
+
+
 def emit_to_google_docs(
     record: Dict[str, Any],
     *,
@@ -210,6 +274,10 @@ def emit_to_google_docs(
     max_gap_s: Optional[float] = None,
     headless: bool = False,
     profile_dir: str = ".typetrace-browser-profile",
+    browser_channel: str = "chromium",
+    editor_timeout_s: float = 300.0,
+    should_abort: Optional[Callable[[], bool]] = None,
+    on_status: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """Replay `record` into the Google Docs document `doc_id`.
 
@@ -223,8 +291,35 @@ def emit_to_google_docs(
     "dispatched", "aborted", "duration_s"}. Ctrl+C, or closing the tab or
     browser, aborts the run; the browser is shut down cleanly either way.
     """
-    if not doc_id:
-        raise ValueError("doc_id is required to emit to Google Docs")
+    doc_id = normalize_doc_id(doc_id)
+    editor_timeout_s = finite_number(editor_timeout_s, "editor_timeout_s", positive=True)
+    if browser_channel not in ("chromium", "chrome", "msedge"):
+        raise ValueError("browser_channel must be chromium, chrome or msedge")
+    list(iter_timeline(record, speed=speed, max_gap_s=max_gap_s))
+    validate_live_text(record)
+    keystrokes = record.get("keystrokes", [])
+    url = DOCS_EDIT_URL.format(doc_id=doc_id)
+    def status(message):
+        print(f"TypeTrace: {message}", file=sys.stderr, flush=True)
+        if on_status:
+            on_status(message)
+
+    page = None
+
+    def cancelled():
+        return ((should_abort is not None and should_abort())
+                or (page is not None and page.is_closed()))
+
+    clock: Dict[str, Any] = {"dispatched": 0, "aborted": False, "duration_s": 0.0}
+    saved = False
+    context = None
+    closed_before_cleanup = False
+    if cancelled():
+        return {
+            "emitter": "docs", "doc_id": doc_id, "url": url,
+            "keystrokes": len(keystrokes), "dispatched": 0,
+            "aborted": True, "duration_s": 0.0, "saved": False,
+        }
     try:
         from playwright.sync_api import (
             Error as PlaywrightError,
@@ -236,80 +331,94 @@ def emit_to_google_docs(
             "Emitting to Google Docs requires Playwright: "
             "pip install playwright && playwright install chromium"
         ) from exc
-
-    keystrokes = record.get("keystrokes", [])
-    url = DOCS_EDIT_URL.format(doc_id=doc_id)
-    print(
-        f"typetrace: emitting {len(keystrokes)} keystrokes to Google Docs document {doc_id}",
-        file=sys.stderr,
-    )
-    print(
-        f"  {url}\n"
-        f"  speed x{speed}, gap cap {max_gap_s if max_gap_s is not None else 'off'},"
-        f" profile {profile_dir!r} (sign in to Google in the window if asked)",
-        file=sys.stderr,
-    )
-
-    events = iter_timeline(record, speed=speed, max_gap_s=max_gap_s)
-    clock: Dict[str, Any] = {"dispatched": 0, "aborted": False, "duration_s": 0.0}
-    interrupted = False
-    closed = False
-
-    with sync_playwright() as playwright:
-        context = playwright.chromium.launch_persistent_context(
-            profile_dir, headless=headless
-        )
-        try:
-            page = context.pages[0] if context.pages else context.new_page()
-            page.goto(url, wait_until="domcontentloaded")
-            try:
-                page.wait_for_selector(EDITOR_SELECTOR, timeout=_EDITOR_TIMEOUT_MS)
-            except PlaywrightTimeoutError as exc:
-                raise RuntimeError(
-                    "The Google Docs editor never appeared. If the browser is "
-                    "showing a Google sign-in page, sign in under this profile "
-                    f"({profile_dir!r}) and re-run; the session is kept."
-                ) from exc
-            page.click(EDITOR_SELECTOR)
-
-            cdp = context.new_cdp_session(page)
-
-            def dispatch(event: str, keystroke: Dict[str, Any]) -> None:
-                nonlocal closed
-                if closed:
-                    return
+    try:
+        if cancelled():
+            clock["aborted"] = True
+        else:
+            with sync_playwright() as playwright:
+                status("Opening Google Docs. Sign in in the browser if needed.")
+                context = playwright.chromium.launch_persistent_context(
+                    str(Path(profile_dir).expanduser().resolve()), headless=headless,
+                    channel=browser_channel, chromium_sandbox=True,
+                )
                 try:
-                    for payload in payloads_for(keystroke, event):
-                        cdp.send("Input.dispatchKeyEvent", payload)
-                except PlaywrightError:
-                    # The tab or browser went away mid-run.
-                    closed = True
+                    page = context.pages[0] if context.pages else context.new_page()
+                    if cancelled():
+                        raise ReplayCancelled()
+                    page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                    deadline = time.monotonic() + editor_timeout_s
+                    while not cancelled():
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError(
+                                "Google Docs was not ready before the timeout. Check sign-in and edit "
+                                "access. If Google rejects automated sign-in, use desktop replay in "
+                                "your normal browser. Increase --editor-timeout-s for more login time."
+                            )
+                        try:
+                            page.wait_for_selector(EDITOR_SELECTOR, timeout=500)
+                            if cancelled():
+                                break
+                            editor = page.frame_locator('.docs-texteventtarget-iframe').locator('[contenteditable="true"]')
+                            editor.wait_for(state="attached", timeout=500)
+                            if not editor.is_editable(timeout=500):
+                                page.wait_for_timeout(100)
+                                continue
+                            if cancelled():
+                                break
+                            page.locator(EDITOR_SELECTOR).click(timeout=500)
+                            if cancelled():
+                                break
+                            editor.focus(timeout=500)
+                            break
+                        except PlaywrightTimeoutError:
+                            continue
+                    if cancelled():
+                        clock["aborted"] = True
+                    else:
+                        page.keyboard.press("Meta+ArrowDown" if sys.platform == "darwin" else "Control+End")
+                        status(f"Appending {len(keystrokes)} keystrokes. Press Stop or Ctrl+C to cancel.")
+                        clock = replay_in_page(page, record, speed=speed, max_gap_s=max_gap_s, should_abort=cancelled)
+                        if not clock["aborted"]:
+                            status("Typing finished. Waiting for Google Docs to save…")
+                            page.wait_for_timeout(750)
+                            save_deadline = time.monotonic() + 30
+                            indicator = page.locator(
+                                '[aria-label*="Saved to Drive"], [aria-label*="All changes saved"], '
+                                '[data-tooltip*="Saved to Drive"], [data-tooltip*="All changes saved"]'
+                            )
+                            while not cancelled() and time.monotonic() < save_deadline:
+                                if indicator.count():
+                                    saved = True
+                                    break
+                                page.wait_for_timeout(250)
+                            if cancelled():
+                                clock["aborted"] = True
+                            elif not saved:
+                                raise RuntimeError(
+                                    "Typing finished, but Google Docs did not confirm saving within 30 seconds. "
+                                    "Check the document before replaying again to avoid duplicate text."
+                                )
+                finally:
+                    closed_before_cleanup = page is not None and page.is_closed()
+                    try:
+                        context.close()
+                    except PlaywrightError:
+                        pass
+    except (KeyboardInterrupt, ReplayCancelled):
+        clock["aborted"] = True
+    except PlaywrightError as exc:
+        if closed_before_cleanup or (should_abort is not None and should_abort()):
+            clock["aborted"] = True
+        else:
+            raise RuntimeError(
+                "Google Docs replay failed. Check the document before retrying; some text may "
+                "already have been typed. Close other browsers using the TypeTrace profile. "
+                f"Browser detail: {exc}"
+            ) from exc
 
-            def should_abort() -> bool:
-                return closed or page.is_closed()
-
-            try:
-                clock = run_timeline(events, dispatch, should_abort=should_abort)
-            except KeyboardInterrupt:
-                interrupted = True
-        finally:
-            # Closing the persistent context closes the browser, even when
-            # navigation or the run above failed partway.
-            context.close()
-
-    aborted = interrupted or closed or clock["aborted"]
+    aborted = clock["aborted"]
     state = "aborted" if aborted else "finished"
-    if interrupted:
-        detail = " (Ctrl+C)"
-    elif closed:
-        detail = " (browser closed)"
-    else:
-        detail = ""
-    print(
-        f"typetrace: {state}{detail} - {clock['dispatched']} dispatches"
-        f" in {clock['duration_s']:.1f} s",
-        file=sys.stderr,
-    )
+    status(f"{state}: {clock['dispatched']} key events in {clock['duration_s']:.1f}s")
 
     return {
         "emitter": "docs",
@@ -319,4 +428,5 @@ def emit_to_google_docs(
         "dispatched": clock["dispatched"],
         "aborted": aborted,
         "duration_s": clock["duration_s"],
+        "saved": saved,
     }

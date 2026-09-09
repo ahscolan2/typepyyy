@@ -10,8 +10,11 @@ The JSON record is the machine-readable artifact. This is the one you read to
 see whether the generated process actually looks like someone writing.
 """
 
+import math
 import unicodedata
 from typing import Any, Dict, List, Optional
+
+from wcwidth import iter_graphemes, wcswidth
 
 # Events quieter than this are not worth a line of their own; the writer is
 # simply typing.
@@ -108,15 +111,34 @@ def display_char(char: Optional[str]) -> str:
 
 
 def visible_tail(text: str, width: int) -> str:
-    """The last `width` characters of `text`, with the cursor marked.
+    """The last `width` terminal cells of `text`, with the cursor marked.
 
-    Control characters are replaced with visible glyphs so one keystroke stays
-    one column and the timeline does not wrap.
+    Keep complete graphemes: a combining accent stays with its base and an
+    emoji sequence stays together. Controls retain their visible stand-ins.
     """
-    tail = text[-width:] if width > 0 else ""
-    rendered = "".join(display_char(ch) for ch in tail)
-    prefix = ELLIPSIS if len(text) > len(tail) else ""
-    return f"{prefix}{rendered}{CURSOR}"
+    clusters = list(iter_graphemes(text))
+    tail = []
+    cells = 0
+    for cluster in reversed(clusters):
+        rendered = _display_cluster(cluster)
+        cells += wcswidth(rendered)
+        if cells > max(width, 0):
+            break
+        tail.append(rendered)
+    prefix = ELLIPSIS if len(tail) < len(clusters) else ""
+    return f"{prefix}{''.join(reversed(tail))}{CURSOR}"
+
+
+def _display_cluster(cluster: str) -> str:
+    # Joiners inside a grapheme belong to its glyph, such as a family emoji.
+    # Standalone format characters still receive the visible control marker.
+    rendered = "".join(
+        ch if ch == "\u200d" and 0 < index < len(cluster) - 1 else display_char(ch)
+        for index, ch in enumerate(cluster)
+    )
+    # A leading, unattached accent must not decorate the table's padding or
+    # ellipsis. A dotted circle gives it its own visible cell.
+    return "◌" + rendered if wcswidth(rendered) == 0 else rendered
 
 
 def _moments(
@@ -124,118 +146,88 @@ def _moments(
     pause_threshold_ms: float,
     width: int = DEFAULT_WIDTH,
 ) -> List[dict]:
-    """Time-ordered notable events, each already carrying the document state.
-
-    Keystrokes and intervals are merged onto one ordering so a pause appears
-    between the keystrokes it separates rather than in a list of its own.
-
-    Only the tail of the document is kept per moment. The DOCUMENT column
-    shows the last `width` characters and marks anything before them with an
-    ellipsis, so carrying the whole document forward on every keystroke costs
-    a full string build per keystroke - quadratic in the length of the essay,
-    which is what made rendering a 57k-character document take sixteen
-    seconds. One character past the width is enough for visible_tail to still
-    see that it truncated.
-    """
-    keystrokes = record["keystrokes"]
-    gaps = [i for i in record.get("intervals", []) if i["kind"] == "session_gap"]
-    keep = max(width, 0) + 1
-
-    # Thinking pauses come from the record's own interval list, which the
-    # pipeline writes in time order, one entry per pause, gaps excluded.
-    # Deriving them from iki_ms - motor_iki_ms instead goes wrong at a session
-    # boundary twice over: the difference contains the whole gap (already
-    # reported on its own STOP line), and motor_iki_ms is a sentinel 0.0 on the
-    # resuming keystroke, so what is left over after subtracting the gap is
-    # that keystroke's motor interval masquerading as thought. The derivation
-    # survives below only for a record with no interval list at all.
-    pauses = (
-        [i for i in record["intervals"] if i["kind"] == "pause"]
-        if "intervals" in record
-        else None
-    )
-    pause_index = 0
-
+    """Merge intervals and keys, retaining only the visible document tail."""
+    intervals = sorted(record.get("intervals", []), key=lambda item: item["start_ms"])
+    interval_index = 0
     moments: List[dict] = []
+    # Keep the editable buffer as graphemes. Updating only its final cluster
+    # avoids rebuilding the full document for every keystroke.
     buffer: List[str] = []
-    gap_index = 0
-    # Fallback bookkeeping only: duration of a session gap that has been
-    # reported but whose silence is still sitting in the next iki_ms.
-    gap_carry_ms = 0.0
 
-    for position, event in enumerate(keystrokes):
-        # Any session gap that started before this keystroke belongs here.
-        while gap_index < len(gaps) and gaps[gap_index]["start_ms"] <= event["keydown_ms"]:
+    def snapshot() -> str:
+        tail = []
+        cells = 0
+        for cluster in reversed(buffer):
+            tail.append(cluster)
+            cells += wcswidth(_display_cluster(cluster))
+            if cells > width:
+                break  # One overflow cluster lets visible_tail mark clipping.
+        return "".join(reversed(tail))
+
+    def add_interval(interval: dict) -> None:
+        if interval["kind"] == "pause":
+            if interval["duration_ms"] < pause_threshold_ms:
+                return
+            moments.append({
+                "kind": "pause",
+                "at_ms": interval["start_ms"],
+                "pause_ms": interval["duration_ms"],
+                "text": snapshot(),
+            })
+        elif interval["kind"] == "session_gap":
             moments.append({
                 "kind": "session_gap",
-                "at_ms": gaps[gap_index]["start_ms"],
-                "duration_ms": gaps[gap_index]["duration_ms"],
-                "text": "".join(buffer[-keep:]),
+                "at_ms": interval["start_ms"],
+                "duration_ms": interval["duration_ms"],
+                "text": snapshot(),
             })
-            gap_carry_ms += gaps[gap_index]["duration_ms"]
-            gap_index += 1
+
+    previous = None
+    for position, event in enumerate(record["keystrokes"]):
+        while (
+            interval_index < len(intervals)
+            and intervals[interval_index]["start_ms"] <= event["keydown_ms"]
+        ):
+            add_interval(intervals[interval_index])
+            interval_index += 1
+
+        # Older records lack explicit intervals. Keep their pause estimate,
+        # but attach it to the pre-keystroke document like modern records.
+        if "intervals" not in record and previous is not None:
+            pause_ms = max(0.0, event["iki_ms"] - event["motor_iki_ms"])
+            if pause_ms > 0.0:
+                add_interval({
+                    "kind": "pause",
+                    "start_ms": previous["keyup_ms"],
+                    "duration_ms": pause_ms,
+                })
 
         is_backspace = event["kind"] == "backspace"
         if is_backspace:
             if buffer:
-                buffer.pop()
+                buffer.extend(iter_graphemes(buffer.pop()[:-1]))
         else:
-            buffer.append(event["char"])
+            previous_cluster = buffer.pop() if buffer else ""
+            buffer.extend(iter_graphemes(previous_cluster + event["char"]))
 
         role = event["role"]
-        if pauses is not None:
-            # Every pause interval that ended before this keydown belongs to
-            # this keystroke: the pipeline flushes a pause when the keystroke
-            # that ends it lands, so its start always precedes that keydown.
-            pause_ms = 0.0
-            while (
-                pause_index < len(pauses)
-                and pauses[pause_index]["start_ms"] < event["keydown_ms"]
-            ):
-                pause_ms += pauses[pause_index]["duration_ms"]
-                pause_index += 1
-            gap_carry_ms = 0.0
+        if role in {"typo", "correction", "revision_delete", "revision_retype"}:
+            kind = role
         else:
-            pause_ms = event["iki_ms"] - event["motor_iki_ms"] - gap_carry_ms
-            gap_carry_ms = 0.0
-            if pause_ms < 0.0:
-                pause_ms = 0.0
-
-        if position == 0:
-            kind = "begin"
-        elif role == "typo":
-            kind = "typo"
-        elif role == "correction":
-            kind = "correction"
-        elif role == "revision_delete":
-            kind = "revision_delete"
-        elif role == "revision_retype":
-            kind = "revision_retype"
-        elif pause_ms >= pause_threshold_ms:
-            kind = "pause"
-        else:
-            kind = "typing"
-
+            kind = "begin" if position == 0 else "typing"
         moments.append({
             "kind": kind,
             "at_ms": event["keydown_ms"],
-            "pause_ms": pause_ms,
             "char": event["char"],
             "is_backspace": is_backspace,
             "role": role,
-            "text": "".join(buffer[-keep:]),
+            "text": snapshot(),
             "index": position,
         })
+        previous = event
 
-    while gap_index < len(gaps):
-        moments.append({
-            "kind": "session_gap",
-            "at_ms": gaps[gap_index]["start_ms"],
-            "duration_ms": gaps[gap_index]["duration_ms"],
-            "text": "".join(buffer[-keep:]),
-        })
-        gap_index += 1
-
+    for interval in intervals[interval_index:]:
+        add_interval(interval)
     return moments
 
 
@@ -265,7 +257,7 @@ def _collapse(moments: List[dict]) -> List[dict]:
             return
         collapsed.append({
             "kind": FOLDABLE_KINDS[run[0]["kind"]],
-            "at_ms": run[0]["at_ms"],
+            "at_ms": run[-1]["at_ms"],
             "chars": len(run),
             "text": run[-1]["text"],
         })
@@ -325,6 +317,11 @@ def render(
     With `full`, every keystroke gets its own line. Otherwise runs of ordinary
     typing are collapsed and only the interesting moments are listed.
     """
+    if isinstance(width, bool) or not isinstance(width, int) or width < 0:
+        raise ValueError("width must be a non-negative integer")
+    if not math.isfinite(pause_threshold_ms) or pause_threshold_ms < 0:
+        raise ValueError("pause_threshold_ms must be finite and >= 0")
+
     stats = record["statistics"]
     meta = record["metadata"]
     target = record["target_text"]
@@ -358,7 +355,7 @@ def render(
         lines.append("  (no keystrokes)")
         return "\n".join(lines)
 
-    lines.append(f"  {'TIME':>12}  {'DOCUMENT':<{width + 2}} EVENT")
+    lines.append(f"  {'TIME':>12}  {'DOCUMENT'[:width + 2]:<{width + 2}} EVENT")
     lines.append(f"  {'-' * 12}  {'-' * (width + 2)} {'-' * 30}")
 
     for moment in moments:
@@ -370,9 +367,10 @@ def render(
             lines.append("")
             continue
         document = visible_tail(moment["text"], width)
+        padding = " " * (width + 2 - wcswidth(document))
         lines.append(
             f"  {format_timestamp(moment['at_ms']):>12}  "
-            f"{document:<{width + 2}} {_describe(moment)}"
+            f"{document}{padding} {_describe(moment)}"
         )
 
     lines.extend(["", "Final text", "-" * 10, target, ""])

@@ -236,6 +236,8 @@ def test_emit_docs_passes_the_cli_arguments_through(monkeypatch):
         "max_gap_s": 0.5,
         "headless": True,
         "profile_dir": "some-profile",
+        "browser_channel": "chromium",
+        "editor_timeout_s": 300.0,
     }
 
 
@@ -460,7 +462,7 @@ def test_stderr_only_failures_carry_no_traceback():
 # --- emission flag validation ------------------------------------------------
 
 
-@pytest.mark.parametrize("value", ["0", "0.0", "-1", "-2.5", "nan"])
+@pytest.mark.parametrize("value", ["0", "0.0", "-1", "-2.5", "nan", "inf", "-inf"])
 def test_emit_speed_must_be_positive(value):
     """--emit-speed divides the record's clock.
 
@@ -475,7 +477,7 @@ def test_emit_speed_must_be_positive(value):
     assert excinfo.value.code == 2
 
 
-@pytest.mark.parametrize("value", ["-1", "-0.5", "nan"])
+@pytest.mark.parametrize("value", ["-1", "-0.5", "nan", "inf", "-inf"])
 def test_emit_max_gap_must_not_be_negative(value):
     with pytest.raises(SystemExit) as excinfo:
         build_parser().parse_args(
@@ -493,3 +495,95 @@ def test_valid_emit_speeds_are_accepted(value):
 def test_zero_is_a_valid_max_gap():
     args = build_parser().parse_args(["--text", "Hi.", "--emit-max-gap-s", "0"])
     assert args.emit_max_gap_s == 0.0
+
+
+def test_utf8_bom_is_not_part_of_the_target_text(tmp_path):
+    path = tmp_path / "bom.txt"
+    path.write_bytes("Hello café.".encode("utf-8-sig"))
+    assert load_text(f"@{path}") == "Hello café."
+
+
+def test_existing_output_is_rejected_before_generation(tmp_path, monkeypatch):
+    path = tmp_path / "record.json"
+    path.write_text("original", encoding="utf-8")
+    def unexpected(**kwargs):
+        pytest.fail("generation should not start with an unusable output path")
+    monkeypatch.setattr(main, "generate_full_output", unexpected)
+    assert main.main(["-t", "hello", "-o", str(path)]) == 1
+
+
+def test_failed_replacement_keeps_original_output(tmp_path, monkeypatch):
+    path = tmp_path / "record.json"
+    path.write_text("original", encoding="utf-8")
+    def fail_replace(*args):
+        raise OSError("disk error")
+    monkeypatch.setattr(main.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="disk error"):
+        main.write_output(path, "replacement", overwrite=True)
+    assert path.read_text(encoding="utf-8") == "original"
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_output_created_during_write_is_not_overwritten(tmp_path, monkeypatch):
+    path = tmp_path / "record.json"
+    publish_name = "rename" if main.os.name == "nt" else "link"
+    original_publish = getattr(main.os, publish_name)
+    def race(source, target):
+        path.write_text("another writer", encoding="utf-8")
+        return original_publish(source, target)
+    monkeypatch.setattr(main.os, publish_name, race)
+    with pytest.raises(FileExistsError):
+        main.write_output(path, "replacement")
+    assert path.read_text(encoding="utf-8") == "another writer"
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_emitter_runtime_errors_are_concise(monkeypatch, capsys):
+    def fail(*args, **kwargs):
+        raise RuntimeError("editor did not open")
+    monkeypatch.setattr(main, "emit_record", fail)
+    assert main.main(["-t", "hello", "--emit", "desktop"]) == 1
+    output = capsys.readouterr()
+    assert "error: editor did not open" in output.err
+    assert json.loads(output.out)["target_text"] == "hello"
+
+
+def test_aborted_replay_returns_interrupt_exit_code(monkeypatch):
+    monkeypatch.setattr(main, "emit_record", lambda *args: {"aborted": True})
+    assert main.main(["-t", "hello", "--emit", "desktop"]) == 130
+
+
+def test_unknown_emit_target_does_not_fall_back_to_desktop(monkeypatch):
+    monkeypatch.setitem(sys.modules, "desktop_emitter", None)
+    args = build_parser().parse_args(["-t", "hello"])
+    args.emit = "invalid"
+    with pytest.raises(ValueError, match="unknown emission target"):
+        main.emit_record({}, args)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
+def test_editor_timeout_must_be_finite_and_positive(value):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["-t", "x", "--editor-timeout-s", value])
+
+
+def test_browser_options_and_callbacks_reach_the_emitter(monkeypatch):
+    captured = {}
+    def emit(record, **kwargs):
+        captured.update(kwargs)
+        return {}
+    monkeypatch.setitem(sys.modules, "docs_emitter", types.SimpleNamespace(emit_to_google_docs=emit))
+    args = build_parser().parse_args([
+        "-t", "x", "--emit", "docs", "--doc-id", "abc", "--browser-channel", "msedge",
+        "--editor-timeout-s", "45",
+    ])
+    def abort():
+        return False
+
+    def status(message):
+        pass
+    main.emit_record({}, args, should_abort=abort, on_status=status)
+    assert captured["browser_channel"] == "msedge"
+    assert captured["editor_timeout_s"] == 45
+    assert captured["should_abort"] is abort
+    assert captured["on_status"] is status

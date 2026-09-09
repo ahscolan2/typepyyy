@@ -1,9 +1,11 @@
 # Runtime dependencies. Lower bounds only: newer releases are expected to work,
 # and pip resolves a build appropriate to the interpreter on 3.10-3.14.
 
-# timing_engine draws from np.random.Generator/PCG64. It is the only
-# third-party import in the package.
+# timing_engine draws from np.random.Generator/PCG64.
 numpy>=1.24.0
+
+# replay measures terminal cells and preserves Unicode grapheme boundaries.
+wcwidth>=0.3.0
 
 # Test and lint tools are NOT here: installing from this file should not put a
 # test runner in a runtime environment. See requirements-dev.txt, or

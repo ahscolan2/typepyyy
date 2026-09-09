@@ -34,6 +34,7 @@ measured from a corpus; a consumer who needs calibrated rates should set them.
 
 import random
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -405,7 +406,7 @@ CONFUSIONS = _build_confusion_table()
 
 # A word, optionally carrying one internal apostrophe so "it's" and "they're"
 # are single tokens. \w+ would split them and never match the table.
-WORD_PATTERN = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)?")
+WORD_PATTERN = re.compile(r"(?<!\w)[^\W\d_]+(?:['’][^\W\d_]+)*(?!\w)")
 
 TYPOGRAPHIC_APOSTROPHE = "’"
 
@@ -456,6 +457,16 @@ class SemanticSubstitution:
             match
             for match in WORD_PATTERN.finditer(text)
             if self._lookup_key(match.group(0)) in self.substitutions
+            # Python's \w excludes combining marks; they still belong to
+            # the surrounding word and must not create a replacement boundary.
+            and not (
+                match.start() > 0
+                and unicodedata.category(text[match.start() - 1]).startswith("M")
+            )
+            and not (
+                match.end() < len(text)
+                and unicodedata.category(text[match.end()]).startswith("M")
+            )
         ]
 
     @staticmethod

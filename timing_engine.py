@@ -257,14 +257,16 @@ class TimingEngine:
                 f"unknown profile {profile!r}; expected one of "
                 f"{sorted(PROFILE_MULTIPLIERS)}"
             )
+        if not 0.0 < phi < 1.0:
+            raise ValueError(f"phi must be in (0, 1), got {phi}")
         if not 0.0 <= target_autocorrelation < phi:
             raise ValueError(
                 f"target_autocorrelation must be in [0, phi); got "
                 f"{target_autocorrelation} with phi={phi}. The emitted "
                 f"autocorrelation cannot reach the latent persistence."
             )
-        if not fatigue_rate >= 0.0:
-            raise ValueError(f"fatigue_rate must be >= 0, got {fatigue_rate}")
+        if not math.isfinite(fatigue_rate) or fatigue_rate < 0.0:
+            raise ValueError(f"fatigue_rate must be finite and >= 0, got {fatigue_rate}")
         if not 0.0 <= warmup_strength < 1.0:
             raise ValueError(
                 f"warmup_strength must be in [0, 1), got {warmup_strength}"

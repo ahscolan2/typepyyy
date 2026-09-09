@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "typetrace"
-# Tracks the record "schema_version" emitted in main.WATERMARK, so a dataset can
-# be traced back to the generator release that produced it.
-version = "2.0.0"
+# Package versions and record schema versions evolve independently.
+version = "2.1.0"
 description = "Offline generator of synthetic writing-process datasets for detector training"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Project TypeTrace" }]
 keywords = [
     "keystroke-dynamics",
@@ -29,10 +29,11 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
-# numpy is the only third-party import in the package: timing_engine draws from a
-# per-instance np.random.Generator.
+# timing_engine uses numpy for per-instance randomness; replay uses wcwidth
+# for terminal-cell measurements and Unicode grapheme boundaries.
 dependencies = [
     "numpy>=1.24.0",
+    "wcwidth>=0.3.0",
 ]
 
 [project.optional-dependencies]
@@ -50,13 +51,21 @@ docs = [
 desktop = [
     "pynput>=1.7",
 ]
+build = [
+    "pyinstaller>=6.22,<7",
+    "pynput>=1.8,<2",
+    "playwright>=1.62,<2",
+]
 
 [project.urls]
-Homepage = "https://github.com/ahscolan2/typetrace"
+Homepage = "https://github.com/ahscolan2/typepyyy"
 
 [project.scripts]
 # main.main returns an exit code, which is exactly what console_scripts expects.
 typetrace = "main:main"
+
+[project.gui-scripts]
+typetrace-gui = "launcher:main"
 
 [tool.setuptools]
 # The package is a set of flat modules at the repository root rather than a
@@ -71,6 +80,8 @@ py-modules = [
     "gui",
     "macro_scripter",
     "main",
+    "launcher",
+    "presets",
     "pipeline",
     "replay",
     "timing_engine",

@@ -1,26 +1,14 @@
-"""
-Project TypeTrace - Desktop application
+"""Tkinter interface for generating records and replaying them in editors.
 
-A window over the same generator the CLI drives. Every parameter the CLI
-accepts is here with the same defaults, the record renders in any of the
-CLI's three output formats, and the optional live replay into an editor
-(--emit on the CLI) is wired through the same emit_record function, so a
-given seed yields the identical record either way.
-
-The layout walks the workflow in order: paste or load the text, tune the
-writing model, pick the output format, optionally replay the record into a
-live document, then run. Generation happens off the UI thread and reports
-back through a queue, so a long document looks busy rather than crashed.
-
-Built on tkinter so the application has no dependency the library does not
-already have. Launch it with:
-
-    python gui.py
+Uses the same defaults and generator as the CLI. Workers report through a
+queue; only the main thread touches widgets. Launch with ``typetrace-gui``
+or ``python gui.py``.
 """
 
 import argparse
 import gc
 import importlib.util
+import math
 import queue
 import threading
 import tkinter as tk
@@ -32,7 +20,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy.random  # noqa: F401 - see below
 import macro_scripter as ms
 import timing_engine as te
-from main import emit_record, generate_full_output, render_record
+from main import emit_record, generate_full_output, load_text, render_record, write_output
+from presets import PARAGRAPH, get_default_browser_profile_dir, get_default_output_dir, get_preset, list_presets
 from timing_engine import AR1_PHI, DEFAULT_TARGET_AUTOCORRELATION
 
 # numpy lazily imports its np.random submodule on first attribute access.
@@ -42,12 +31,8 @@ from timing_engine import AR1_PHI, DEFAULT_TARGET_AUTOCORRELATION
 # objects on that thread. Importing eagerly keeps the free work on the main
 # thread.
 
-WINDOW_TITLE = "TypeTrace - synthetic writing process generator"
-DEFAULT_TEXT = (
-    "Academic integrity is essential to higher education. Students must "
-    "produce original work, and institutions need reliable ways to evaluate "
-    "how that work was produced."
-)
+WINDOW_TITLE = "TypeTrace"
+DEFAULT_TEXT = PARAGRAPH
 
 # Poll interval for results coming back from the worker thread, ms. Short
 # enough to feel immediate, long enough not to spin.
@@ -69,8 +54,8 @@ OUTPUT_FORMATS = (
 DEFAULT_FORMAT = "json"
 FORMAT_EXTENSIONS = {"json": ".json", "replay": ".txt", "replay-full": ".txt"}
 
-# Mirrors the --browser-profile default on the CLI.
-DEFAULT_BROWSER_PROFILE = ".typetrace-browser-profile"
+# A writable path also works when the EXE is launched from a read-only folder.
+DEFAULT_BROWSER_PROFILE = str(get_default_browser_profile_dir())
 
 # Live replay is an optional feature with its own dependencies (the CLI's
 # [docs] and [desktop] extras); the generator itself needs neither. The value
@@ -104,9 +89,12 @@ def _integer(raw: str) -> int:
 
 def _number(raw: str) -> float:
     try:
-        return float(raw)
+        value = float(raw)
     except ValueError:
         raise ValueError(f"{raw!r} is not a number") from None
+    if not math.isfinite(value):
+        raise ValueError("must be a finite number")
+    return value
 
 
 def _typo_model_name(raw: str) -> str:
@@ -177,6 +165,7 @@ GENERATOR_FIELDS: Tuple[Field, ...] = (
         default="",
         hint="integer; blank for a random run (e.g. 42)",
         parse=_integer,
+        check=_non_negative,
     ),
     Field(
         key="typo_rate",
@@ -277,6 +266,8 @@ def collect_parameters(raw: Dict[str, str]) -> Dict[str, Any]:
     Raises ValueError, prefixed with the offending field's label, on anything
     that is unparseable or out of range.
     """
+    if raw["profile"] not in PROFILES:
+        raise ValueError(f"Profile: choose one of {', '.join(PROFILES)}")
     kwargs: Dict[str, Any] = {"profile": raw["profile"]}
     for field in GENERATOR_FIELDS:
         text = raw[field.key].strip()
@@ -303,12 +294,14 @@ def default_emit_options() -> Dict[str, Any]:
     """The untouched emission controls (off, matching the CLI default)."""
     return {
         "enabled": False,
-        "target": "docs",
+        "target": "desktop",
         "doc_id": "",
         "emit_speed": "1.0",
         "emit_max_gap_s": "",
         "headless": False,
         "browser_profile": DEFAULT_BROWSER_PROFILE,
+        "browser_channel": "chrome",
+        "editor_timeout_s": "300",
     }
 
 
@@ -322,6 +315,8 @@ def collect_emit_options(raw: Dict[str, Any]) -> Optional[argparse.Namespace]:
     if not raw["enabled"]:
         return None
     target = raw["target"]
+    if target not in EMIT_TARGETS:
+        raise ValueError(f"Unknown replay target: {target!r}")
 
     speed_text = raw["emit_speed"].strip() or "1.0"
     try:
@@ -346,6 +341,15 @@ def collect_emit_options(raw: Dict[str, Any]) -> Optional[argparse.Namespace]:
         raise ValueError("Doc ID: required for Google Docs emission")
 
     browser_profile = raw["browser_profile"].strip() or DEFAULT_BROWSER_PROFILE
+    browser_channel = raw.get("browser_channel", "chromium")
+    if browser_channel not in ("chromium", "chrome", "msedge"):
+        raise ValueError("Browser: choose chromium, chrome, or msedge")
+    try:
+        timeout = _number(str(raw.get("editor_timeout_s", "300")).strip() or "300")
+    except ValueError as exc:
+        raise ValueError(f"Editor timeout: {exc}") from None
+    if timeout <= 0:
+        raise ValueError("Editor timeout: must be above 0")
 
     return argparse.Namespace(
         emit=target,
@@ -354,6 +358,8 @@ def collect_emit_options(raw: Dict[str, Any]) -> Optional[argparse.Namespace]:
         emit_max_gap_s=max_gap_s,
         headless=bool(raw["headless"]),
         browser_profile=browser_profile,
+        browser_channel=browser_channel,
+        editor_timeout_s=timeout,
     )
 
 
@@ -424,7 +430,7 @@ class Application(ttk.Frame):
         master.columnconfigure(0, weight=1)
         master.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(3, weight=1)  # the preview stretches
+        self.rowconfigure(3, weight=1)
 
         # Results arrive from a worker thread; tkinter is not thread-safe, so
         # they are queued and picked up by the main loop rather than touched
@@ -432,11 +438,29 @@ class Application(ttk.Frame):
         self._results: "queue.Queue[tuple]" = queue.Queue()
         self._record: Optional[Dict[str, Any]] = None
         self._busy = False
+        self._stop_requested = threading.Event()
+        self._worker_thread: Optional[threading.Thread] = None
         self._support = emit_support()
 
+        self._build_setups()
+        self._settings = ttk.Notebook(self)
+        self._settings.grid(row=1, column=0, sticky="nsew")
+        self._input_page = ttk.Frame(self._settings, padding=8)
+        model_page = ttk.Frame(self._settings, padding=8)
+        replay_page = ttk.Frame(self._settings, padding=8)
+        for page, title in (
+            (self._input_page, "Text"), (model_page, "Model"),
+            (replay_page, "Live replay"),
+        ):
+            page.columnconfigure(0, weight=1)
+            page.rowconfigure(0, weight=1)
+            self._settings.add(page, text=title)
         self._build_input()
-        self._build_middle()
+        self._build_parameters(model_page)
+        self._build_emission(replay_page)
         self._build_actions()
+        self._result_tabs = ttk.Notebook(self)
+        self._result_tabs.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
         self._build_preview()
         self._build_status()
 
@@ -447,6 +471,7 @@ class Application(ttk.Frame):
         self.bind("<Destroy>", self._on_destroy)
 
     def _on_destroy(self, _event: tk.Event) -> None:
+        self._stop_requested.set()
         if self._drain_job is not None:
             try:
                 self.after_cancel(self._drain_job)
@@ -465,13 +490,56 @@ class Application(ttk.Frame):
 
     # -- layout --------------------------------------------------------------
 
-    def _build_input(self) -> None:
-        frame = ttk.LabelFrame(self, text="1 · Text", padding=8)
-        frame.grid(row=0, column=0, sticky="ew")
-        frame.columnconfigure(0, weight=1)
+    def _build_setups(self) -> None:
+        bar = ttk.Frame(self)
+        bar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        bar.columnconfigure(1, weight=1)
+        ttk.Label(bar, text="Writing setup").grid(row=0, column=0, padx=(0, 8))
+        self.setup = tk.StringVar(value=get_preset("preview").name)
+        self._setup_combo = ttk.Combobox(
+            bar, textvariable=self.setup, values=[p.name for p in list_presets()],
+            state="readonly", width=30,
+        )
+        self._setup_combo.grid(row=0, column=1, sticky="w")
+        self._setup_combo.bind("<<ComboboxSelected>>", self._apply_setup)
+        self._sample_button = ttk.Button(bar, text="Use example text", command=self._use_example)
+        self._sample_button.grid(row=0, column=2, padx=(8, 0))
+        self.setup_description = tk.StringVar(value=get_preset("preview").description)
+        ttk.Label(bar, textvariable=self.setup_description, wraplength=720).grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(6, 0),
+        )
 
-        self.text_input = tk.Text(frame, height=6, wrap="word", font=MONO)
-        self.text_input.grid(row=0, column=0, sticky="ew")
+    def _apply_setup(self, _event: Optional[tk.Event] = None) -> None:
+        if self._busy:
+            return
+        preset = get_preset(self.setup.get())
+        parameters = preset.to_gui_parameters()
+        self.profile.set(parameters["profile"])
+        for key, row in self.rows.items():
+            row.variable.set(parameters[key])
+        self.emit_enabled.set(preset.emit_enabled)
+        self.emit_target.set("desktop")
+        self.emit_speed.set(str(preset.emit_speed))
+        self.emit_max_gap.set("" if preset.emit_max_gap_s is None else str(preset.emit_max_gap_s))
+        self.setup_description.set(preset.description)
+        self._update_emit_state()
+        self.status.set(f"{preset.name} selected. Your text is unchanged.")
+
+    def _use_example(self) -> None:
+        if self._busy:
+            return
+        self.text_input.delete("1.0", "end")
+        self.text_input.insert("1.0", get_preset(self.setup.get()).sample_text)
+        self._update_char_count()
+
+    def _build_input(self) -> None:
+        frame = ttk.Frame(self._input_page)
+        frame.grid(row=0, column=0, sticky="nsew")
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        self.text_input = tk.Text(frame, height=10, wrap="word", font=MONO, undo=True)
+        self.text_input.grid(row=0, column=0, sticky="nsew")
         self.text_input.insert("1.0", DEFAULT_TEXT)
 
         scroll = ttk.Scrollbar(frame, command=self.text_input.yview)
@@ -482,7 +550,7 @@ class Application(ttk.Frame):
         buttons.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         buttons.columnconfigure(2, weight=1)
         ttk.Button(
-            buttons, text="Load @file…", command=self._load_file
+            buttons, text="Load text file…", command=self._load_file
         ).grid(row=0, column=0, sticky="w")
         ttk.Button(buttons, text="Clear", command=self._clear_text).grid(
             row=0, column=1, sticky="w", padx=(6, 0)
@@ -491,30 +559,15 @@ class Application(ttk.Frame):
         ttk.Label(buttons, textvariable=self.char_count, foreground="grey").grid(
             row=0, column=2, sticky="e"
         )
-        self.text_input.bind("<KeyRelease>", lambda _e: self._update_char_count())
+        self.text_input.bind("<<Modified>>", self._text_modified)
         self._update_char_count()
 
-    def _build_middle(self) -> None:
-        middle = ttk.Frame(self)
-        middle.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
-        middle.columnconfigure(0, weight=3)
-        middle.columnconfigure(1, weight=2)
-        middle.rowconfigure(0, weight=1)
-
-        self._build_parameters(middle)
-
-        right = ttk.Frame(middle)
-        right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
-        right.columnconfigure(0, weight=1)
-        self._build_output_options(right)
-        self._build_emission(right)
-
     def _build_parameters(self, parent: tk.Widget) -> None:
-        frame = ttk.LabelFrame(parent, text="2 · Model parameters", padding=8)
+        frame = ttk.Frame(parent)
         frame.grid(row=0, column=0, sticky="nsew")
         frame.columnconfigure(2, weight=1)
 
-        ttk.Label(frame, text="Profile").grid(
+        ttk.Label(frame, text="Typing rhythm").grid(
             row=0, column=0, sticky="w", padx=(0, 8), pady=3
         )
         self.profile = tk.StringVar(value=PROFILE_DEFAULT)
@@ -534,7 +587,7 @@ class Application(ttk.Frame):
             self.rows[field.key] = ParameterRow(frame, index, field)
 
     def _build_output_options(self, parent: tk.Widget) -> None:
-        frame = ttk.LabelFrame(parent, text="3 · Output", padding=8)
+        frame = ttk.Frame(parent)
         frame.grid(row=0, column=0, sticky="ew")
         frame.columnconfigure(0, weight=1)
 
@@ -546,13 +599,11 @@ class Application(ttk.Frame):
                 value=value,
                 variable=self.format,
                 command=self._refresh_view,
-            ).grid(row=index, column=0, sticky="w", pady=2)
+            ).grid(row=0, column=index, sticky="w", padx=(0, 12), pady=2)
 
     def _build_emission(self, parent: tk.Widget) -> None:
-        frame = ttk.LabelFrame(
-            parent, text="4 · Emission into a live editor (optional)", padding=8
-        )
-        frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        frame = ttk.Frame(parent)
+        frame.grid(row=0, column=0, sticky="nsew")
         frame.columnconfigure(2, weight=1)
 
         self.emit_enabled = tk.BooleanVar(value=False)
@@ -566,7 +617,7 @@ class Application(ttk.Frame):
         ttk.Label(frame, text="Target").grid(
             row=1, column=0, sticky="w", padx=(0, 8), pady=3
         )
-        self.emit_target = tk.StringVar(value="docs")
+        self.emit_target = tk.StringVar(value="desktop")
         self._emit_target_combo = ttk.Combobox(
             frame,
             textvariable=self.emit_target,
@@ -583,13 +634,13 @@ class Application(ttk.Frame):
             foreground="grey",
         ).grid(row=1, column=2, sticky="w", padx=(8, 0), pady=3)
 
-        ttk.Label(frame, text="Doc ID").grid(
+        ttk.Label(frame, text="Doc URL or ID").grid(
             row=2, column=0, sticky="w", padx=(0, 8), pady=3
         )
         self.doc_id = tk.StringVar()
         self._doc_id_entry = ttk.Entry(frame, textvariable=self.doc_id, width=26)
         self._doc_id_entry.grid(row=2, column=1, sticky="w", pady=3)
-        ttk.Label(frame, text="from the document's URL", foreground="grey").grid(
+        ttk.Label(frame, text="paste the full document URL", foreground="grey").grid(
             row=2, column=2, sticky="w", padx=(8, 0), pady=3
         )
 
@@ -640,11 +691,28 @@ class Application(ttk.Frame):
         )
         self._profile_browse.grid(row=6, column=2, sticky="w", padx=(8, 0), pady=3)
 
+        ttk.Label(frame, text="Browser").grid(row=7, column=0, sticky="w", pady=3)
+        self.browser_channel = tk.StringVar(value="chrome")
+        self._browser_combo = ttk.Combobox(
+            frame, textvariable=self.browser_channel,
+            values=["chromium", "chrome", "msedge"], state="readonly", width=14,
+        )
+        self._browser_combo.grid(row=7, column=1, sticky="w", pady=3)
+        ttk.Label(frame, text="Chrome and Edge use their installed browser", foreground="grey").grid(
+            row=7, column=2, sticky="w", padx=(8, 0), pady=3
+        )
+        ttk.Label(frame, text="Sign-in timeout").grid(row=8, column=0, sticky="w", pady=3)
+        self.editor_timeout = tk.StringVar(value="300")
+        self._timeout_entry = ttk.Entry(frame, textvariable=self.editor_timeout, width=10)
+        self._timeout_entry.grid(row=8, column=1, sticky="w", pady=3)
+        ttk.Label(frame, text="seconds to sign in and open the editor", foreground="grey").grid(
+            row=8, column=2, sticky="w", padx=(8, 0), pady=3
+        )
         self._emit_hint_var = tk.StringVar()
         ttk.Label(
             frame, textvariable=self._emit_hint_var, foreground="grey",
             wraplength=340, justify="left",
-        ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ).grid(row=9, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
         self._update_emit_state()
 
@@ -653,56 +721,62 @@ class Application(ttk.Frame):
         bar.grid(row=2, column=0, sticky="w", pady=(12, 0))
 
         self.generate_button = ttk.Button(
-            bar, text="Generate", command=self._generate
+            bar, text="Generate preview", command=self._generate
         )
         self.generate_button.pack(side="left")
         self.save_button = ttk.Button(
             bar, text="Save output…", command=self._save, state="disabled"
         )
         self.save_button.pack(side="left", padx=(8, 0))
+        self.stop_button = ttk.Button(
+            bar, text="Stop replay", command=self._stop, state="disabled"
+        )
+        self.stop_button.pack(side="left", padx=(8, 0))
         self.overwrite_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            bar, text="Allow overwriting existing files (the CLI's --force)",
+            bar, text="Overwrite existing files",
             variable=self.overwrite_var,
         ).pack(side="left", padx=(12, 0))
 
     def _build_preview(self) -> None:
-        frame = ttk.LabelFrame(self, text="5 · Preview", padding=8)
-        frame.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+        frame = ttk.Frame(self._result_tabs, padding=8)
+        self._result_tabs.add(frame, text="Preview")
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+        self._build_output_options(frame)
 
         self.output = tk.Text(
-            frame, wrap="none", font=MONO, height=16, state="disabled"
+            frame, wrap="none", font=MONO, height=8, state="disabled"
         )
-        self.output.grid(row=0, column=0, sticky="nsew")
+        self.output.grid(row=1, column=0, sticky="nsew")
 
         y_scroll = ttk.Scrollbar(frame, command=self.output.yview)
-        y_scroll.grid(row=0, column=1, sticky="ns")
+        y_scroll.grid(row=1, column=1, sticky="ns")
         x_scroll = ttk.Scrollbar(
             frame, orient="horizontal", command=self.output.xview
         )
-        x_scroll.grid(row=1, column=0, sticky="ew")
+        x_scroll.grid(row=2, column=0, sticky="ew")
         self.output.configure(
             yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set
         )
 
     def _build_status(self) -> None:
-        frame = ttk.LabelFrame(self, text="Log", padding=8)
-        frame.grid(row=4, column=0, sticky="ew", pady=(10, 0))
+        frame = ttk.Frame(self._result_tabs, padding=8)
+        self._result_tabs.add(frame, text="Log")
         frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
 
         self.log = tk.Text(
             frame, height=5, wrap="word", font=MONO, state="disabled"
         )
-        self.log.grid(row=0, column=0, sticky="ew")
+        self.log.grid(row=0, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(frame, command=self.log.yview)
         scroll.grid(row=0, column=1, sticky="ns")
         self.log.configure(yscrollcommand=scroll.set)
 
         self.status = tk.StringVar(value="Ready.")
         ttk.Label(self, textvariable=self.status, foreground="grey").grid(
-            row=5, column=0, sticky="w", pady=(8, 0)
+            row=4, column=0, sticky="w", pady=(8, 0)
         )
 
     # -- raw state -------------------------------------------------------------
@@ -727,6 +801,8 @@ class Application(ttk.Frame):
             "emit_max_gap_s": self.emit_max_gap.get(),
             "headless": self.headless.get(),
             "browser_profile": self.browser_profile.get(),
+            "browser_channel": self.browser_channel.get(),
+            "editor_timeout_s": self.editor_timeout.get(),
         }
 
     # -- emission controls -----------------------------------------------------
@@ -746,6 +822,8 @@ class Application(ttk.Frame):
 
     def _update_emit_state(self, _event: Optional[tk.Event] = None) -> None:
         enabled = self.emit_enabled.get()
+        if hasattr(self, "generate_button"):
+            self.generate_button.configure(text="Generate and type…" if enabled else "Generate preview")
         target = self.emit_target.get()
         available, install = self._support.get(target, (False, ""))
 
@@ -765,8 +843,12 @@ class Application(ttk.Frame):
                 self._headless_check,
                 self._profile_entry,
                 self._profile_browse,
+                self._timeout_entry,
             ],
             "normal" if (live and target == "docs") else "disabled",
+        )
+        self._browser_combo.configure(
+            state="readonly" if (live and target == "docs") else "disabled"
         )
 
         if enabled and not available:
@@ -775,8 +857,8 @@ class Application(ttk.Frame):
             )
         elif enabled and target == "desktop":
             self._emit_hint_var.set(
-                "After you click Generate, focus stays on the countdown - give "
-                "the destination window focus when prompted. Esc aborts."
+                "Focus the destination editor during the five-second countdown. "
+                "Press Esc to stop."
             )
         else:
             self._emit_hint_var.set("")
@@ -791,6 +873,11 @@ class Application(ttk.Frame):
     def _update_char_count(self) -> None:
         self.char_count.set(f"{len(self._current_text())} characters")
 
+    def _text_modified(self, _event: tk.Event) -> None:
+        if self.text_input.edit_modified():
+            self._update_char_count()
+            self.text_input.edit_modified(False)
+
     def _clear_text(self) -> None:
         self.text_input.delete("1.0", "end")
         self._update_char_count()
@@ -803,8 +890,8 @@ class Application(ttk.Frame):
         if not path:
             return
         try:
-            content = Path(path).read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
+            content = load_text(f"@{path}")
+        except (OSError, ValueError) as exc:
             messagebox.showerror("Could not read the file", str(exc))
             return
         self.text_input.delete("1.0", "end")
@@ -818,7 +905,7 @@ class Application(ttk.Frame):
             return
 
         text = self._current_text()
-        if not text.strip():
+        if not text:
             messagebox.showwarning("Nothing to generate", "Enter some text first.")
             return
 
@@ -840,6 +927,9 @@ class Application(ttk.Frame):
             return
 
         self._busy = True
+        self._stop_requested.clear()
+        self._setup_combo.configure(state="disabled")
+        self._sample_button.configure(state="disabled")
         self.generate_button.configure(state="disabled")
         self.status.set(f"Generating {len(text)} characters…")
         self._log(
@@ -850,10 +940,25 @@ class Application(ttk.Frame):
         # A long document takes a noticeable moment, and a frozen window looks
         # like a crash. The work happens off the UI thread and reports back
         # through the queue.
-        thread = threading.Thread(
+        self._worker_thread = threading.Thread(
             target=self._worker, args=(text, kwargs, emit_ns), daemon=True
         )
-        thread.start()
+        self._worker_thread.start()
+
+    def _stop(self) -> None:
+        self._stop_requested.set()
+        self.stop_button.configure(state="disabled")
+        self.status.set("Stopping replay…")
+
+    def close(self) -> None:
+        """Let replay release held keys and close its browser before exiting."""
+        self._stop_requested.set()
+        root = self.winfo_toplevel()
+        if self._worker_thread is not None and self._worker_thread.is_alive():
+            root.withdraw()
+            self.after(POLL_MS, self.close)
+        else:
+            root.destroy()
 
     def _worker(
         self,
@@ -863,36 +968,58 @@ class Application(ttk.Frame):
     ) -> None:
         try:
             record = generate_full_output(text=text, **kwargs)
-            emission = (
-                emit_record(record, emit_ns) if emit_ns is not None else None
-            )
         except Exception as exc:  # surfaced in the dialog, not swallowed
             self._results.put(("error", exc, None))
+            return
+        self._results.put(("record", record, emit_ns is not None))
+        if emit_ns is None:
+            self._results.put(("done", None, None))
+            return
+        try:
+            self._results.put(("status", "Preparing live replay…", None))
+            emission = emit_record(
+                record, emit_ns, should_abort=self._stop_requested.is_set,
+                on_status=lambda message: self._results.put(("status", message, None)),
+            )
+        except Exception as exc:
+            self._results.put(("emission_error", exc, None))
         else:
-            self._results.put(("ok", record, emission))
+            self._results.put(("done", None, emission))
 
     def _drain(self) -> None:
         try:
             while True:
                 status, payload, emission = self._results.get_nowait()
+                if status == "status":
+                    self.status.set(str(payload))
+                    self._log(str(payload))
+                    continue
+                if status == "record":
+                    self._record = payload
+                    self._refresh_view()
+                    self.save_button.configure(state="disabled" if emission else "normal")
+                    self.stop_button.configure(state="normal" if emission else "disabled")
+                    line = summary_line(payload)
+                    self.status.set(line)
+                    self._log(line)
+                    continue
                 self._busy = False
+                self._setup_combo.configure(state="readonly")
+                self._sample_button.configure(state="normal")
                 self.generate_button.configure(state="normal")
-                if status == "error":
-                    self.status.set("Generation failed.")
+                self.stop_button.configure(state="disabled")
+                self.save_button.configure(state="normal" if self._record is not None else "disabled")
+                if status in ("error", "emission_error"):
+                    title = "Replay failed" if status == "emission_error" else "Generation failed"
+                    detail = " The generated record is still available to save." if status == "emission_error" else ""
+                    self.status.set(title + "." + detail)
                     self._log(f"error: {type(payload).__name__}: {payload}")
                     messagebox.showerror(
-                        "Generation failed",
-                        f"{type(payload).__name__}: {payload}",
+                        title, f"{type(payload).__name__}: {payload}{detail}",
                     )
                     continue
-                self._record = payload
-                self._refresh_view()
-                self.save_button.configure(state="normal")
-                line = summary_line(payload)
-                self.status.set(line)
-                self._log(line)
                 if emission is not None:
-                    # Same phrasing as the CLI prints for --emit.
+                    self.status.set("Replay stopped. Record available to save." if emission.get("aborted") else "Replay complete. Record available to save.")
                     self._log(f"emission: {emission}")
         except queue.Empty:
             pass
@@ -918,23 +1045,24 @@ class Application(ttk.Frame):
             title="Save output",
             defaultextension=extension,
             initialfile=f"typetrace-record{extension}",
+            initialdir=str(get_default_output_dir()),
             filetypes=[(f"{fmt} output", f"*{extension}"), ("All files", "*.*")],
+            confirmoverwrite=False,
         )
         if not path:
             return
         out_path = Path(path)
         # The overwrite guard from the CLI: refuse to clobber silently; the
         # checkbox plays the role of --force.
-        if out_path.exists() and not self.overwrite_var.get():
+        overwrite = self.overwrite_var.get()
+        if out_path.exists() and not overwrite:
             if not messagebox.askyesno(
                 "File exists", f"{out_path.name} already exists. Overwrite it?"
             ):
                 return
+            overwrite = True
         try:
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(
-                render_output(self._record, fmt), encoding="utf-8"
-            )
+            write_output(out_path, render_output(self._record, fmt), overwrite=overwrite)
         except OSError as exc:
             messagebox.showerror("Could not save", str(exc))
             return
@@ -951,8 +1079,12 @@ class Application(ttk.Frame):
 def main() -> int:
     root = tk.Tk()
     root.title(WINDOW_TITLE)
-    root.minsize(1020, 880)
-    Application(root)
+    root.minsize(760, 620)
+    width = min(1000, root.winfo_screenwidth() - 80)
+    height = min(780, root.winfo_screenheight() - 100)
+    root.geometry(f"{width}x{height}")
+    app = Application(root)
+    root.protocol("WM_DELETE_WINDOW", app.close)
     root.mainloop()
     return 0
 

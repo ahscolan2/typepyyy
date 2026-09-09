@@ -17,7 +17,9 @@ pynput installed.
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
+
+from emit_common import SHIFTED_TO_BASE, finite_number, iter_timeline, run_timeline, validate_live_text
 
 # Named pynput Key attributes for characters that are not text. Key.space is
 # preferred over a " " KeyCode because it hangs up on some Linux layouts less.
@@ -31,12 +33,7 @@ _NAMED_KEYS: Dict[str, str] = {
 # US-QWERTY shifted pairs: the base key on the left, the symbol it produces
 # under Shift on the right. Records carry the produced character, so emission
 # presses Shift plus the base key.
-SHIFT_PAIRS: Dict[str, str] = {
-    "1": "!", "2": "@", "3": "#", "4": "$", "5": "%",
-    "6": "^", "7": "&", "8": "*", "9": "(", "0": ")",
-    "-": "_", "=": "+", "[": "{", "]": "}", "\\": "|",
-    ";": ":", "'": '"', ",": "<", ".": ">", "/": "?", "`": "~",
-}
+SHIFT_PAIRS: Dict[str, str] = {base: shifted for shifted, base in SHIFTED_TO_BASE.items()}
 
 _UNSHIFTED_SYMBOLS = frozenset(SHIFT_PAIRS)
 _SHIFTED_TO_BASE: Dict[str, str] = {shifted: base for base, shifted in SHIFT_PAIRS.items()}
@@ -98,9 +95,23 @@ def describe_keystroke(keystroke: dict) -> KeySpec:
     return describe_character(char)
 
 
+def _foreground_window():
+    """Return a stable window handle on Windows; other platforms use Esc/Stop."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    get_foreground = ctypes.windll.user32.GetForegroundWindow
+    get_foreground.restype = wintypes.HWND
+    return get_foreground()
+
+
 def emit_to_desktop(record: dict, *, speed: float = 1.0,
                     max_gap_s: Optional[float] = None,
-                    initial_delay_s: float = 5.0) -> dict:
+                    initial_delay_s: float = 5.0,
+                    should_abort: Optional[Callable[[], bool]] = None,
+                    on_status: Optional[Callable[[str], None]] = None) -> dict:
     """Replay the record's keystroke clock as real key events on the desktop.
 
     Counts down on stderr for initial_delay_s seconds so the user can focus
@@ -109,6 +120,11 @@ def emit_to_desktop(record: dict, *, speed: float = 1.0,
 
     Returns run_timeline's summary: {"dispatched", "aborted", "duration_s"}.
     """
+    initial_delay_s = finite_number(initial_delay_s, "initial_delay_s")
+    events = list(iter_timeline(record, speed=speed, max_gap_s=max_gap_s))
+    validate_live_text(record)
+    if should_abort is not None and should_abort():
+        return {"dispatched": 0, "aborted": True, "duration_s": 0.0}
     try:
         from pynput import keyboard
     except ImportError as exc:
@@ -116,13 +132,22 @@ def emit_to_desktop(record: dict, *, speed: float = 1.0,
             "pynput is required for desktop emission. Run: pip install pynput"
         ) from exc
 
-    # Imported here so the module loads (and its pure mapping is testable)
-    # even before emit_common or pynput are installed.
-    from emit_common import iter_timeline, run_timeline
-
     import threading
 
     abort_requested = threading.Event()
+    target_window = None
+    focus_lost = False
+
+    def cancelled():
+        nonlocal focus_lost
+        if target_window is not None and _foreground_window() != target_window:
+            focus_lost = True
+        return focus_lost or abort_requested.is_set() or (should_abort is not None and should_abort())
+
+    def status(message):
+        print(message, file=sys.stderr, flush=True)
+        if on_status:
+            on_status(message)
 
     def _on_press(key):
         if key == keyboard.Key.esc:
@@ -136,56 +161,70 @@ def emit_to_desktop(record: dict, *, speed: float = 1.0,
         return keyboard.KeyCode.from_char(spec.char)
 
     controller = keyboard.Controller()
+    held = {}
+    shift_held = False
 
     def dispatch(event: str, keystroke: dict) -> None:
+        nonlocal shift_held
         spec = describe_keystroke(keystroke)
         key = resolve(spec)
         if event == "down":
-            if spec.shift:
-                controller.press(keyboard.Key.shift)
-            controller.press(key)
-            if spec.shift:
-                # Shift wraps the key press alone, not the keystroke's whole
-                # dwell: a rollover key that goes down before this key comes
-                # up must not see Shift held. Releasing it right after the
-                # press keeps the produced character (decided at press time)
-                # and restores the caller's own Shift state.
-                controller.release(keyboard.Key.shift)
+            try:
+                if spec.shift:
+                    shift_held = True
+                    controller.press(keyboard.Key.shift)
+                held[id(keystroke)] = key
+                controller.press(key)
+            finally:
+                if spec.shift:
+                    controller.release(keyboard.Key.shift)
+                    shift_held = False
         else:
             controller.release(key)
+            held.pop(id(keystroke), None)
 
     listener = keyboard.Listener(on_press=_on_press)
     try:
         listener.start()
 
         if initial_delay_s > 0:
-            print(
-                "TypeTrace desktop emission: focus the target editor window.",
-                file=sys.stderr,
-            )
+            status("Focus the target editor. Press Esc or Stop to cancel.")
         remaining = initial_delay_s
-        while remaining > 0 and not abort_requested.is_set():
-            print(
-                f"\rStarting in {remaining:4.1f}s (press Esc to abort)...",
-                end="", file=sys.stderr, flush=True,
-            )
+        last_second = None
+        while remaining > 0 and not cancelled():
+            second = max(1, int(remaining + 0.999))
+            if second != last_second:
+                status(f"Starting in {second}s…")
+                last_second = second
             step = min(0.1, remaining)
             time.sleep(step)
             remaining -= step
-        if initial_delay_s > 0:
-            print("", file=sys.stderr)  # clear the countdown line
-
-        if abort_requested.is_set():
+        if cancelled():
             result = {"dispatched": 0, "aborted": True, "duration_s": 0.0}
         else:
-            events = iter_timeline(record, speed=speed, max_gap_s=max_gap_s)
+            target_window = _foreground_window()
+            status(f"Typing {len(record['keystrokes'])} keystrokes. Press Esc or Stop to cancel.")
             result = run_timeline(
-                events, dispatch, should_abort=abort_requested.is_set
+                events, dispatch, should_abort=cancelled
             )
+    except KeyboardInterrupt:
+        result = {"dispatched": 0, "aborted": True, "duration_s": 0.0}
     finally:
+        for key in held.values():
+            try:
+                controller.release(key)
+            except Exception:
+                pass  # Attempt every release even if one device call fails.
+        if shift_held:
+            try:
+                controller.release(keyboard.Key.shift)
+            except Exception:
+                pass
         listener.stop()
 
-    state = "aborted by Esc" if result["aborted"] else "finished"
+    state = "stopped because focus changed" if focus_lost else ("stopped" if result["aborted"] else "finished")
+    if focus_lost:
+        result["reason"] = "focus_changed"
     print(
         f"TypeTrace desktop emission {state}: {result['dispatched']} key events "
         f"in {result['duration_s']:.1f}s.",
